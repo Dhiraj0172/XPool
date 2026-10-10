@@ -1,5 +1,5 @@
 from typing import Any, Dict, Optional, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 class BaseResponse(BaseModel):
     """Standard success response schema."""
@@ -13,8 +13,7 @@ class ErrorResponse(BaseModel):
     message: str
 
     # Error responses must not leak sensitive paths or credentials
-    class Config:
-        extra = "forbid"
+    model_config = ConfigDict(extra="forbid")
 
 class OperationRequest(BaseModel):
     """Base schema for standard storage operations."""
