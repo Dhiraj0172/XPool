@@ -79,11 +79,24 @@ class RcloneRCAdapter:
         return rel_path.as_posix()
 
     def read(self, path: JulesPath) -> bytes:
+        raise NotImplementedError("Direct memory read via RC is insecure and memory-bound. Use backend copy/hash operations.")
+
+    def hash(self, path: JulesPath, hash_type: str = "sha256") -> str:
         remote_path = self._get_remote_path(path)
-        cmd_payload = {"command": "cat", "arg": [f"{self.remote_name}{remote_path}"]}
-        result = self._execute_rc("core/command", payload=cmd_payload, retries=3)
-        # core/command returns a JSON dict with {"out": "..."} instead of raw bytes
-        return result.get("out", "").encode('utf-8')
+        payload = {
+            "fs": self.remote_name,
+            "remote": remote_path,
+            "hashType": hash_type
+        }
+        try:
+            result = self._execute_rc("operations/hashsumfile", payload=payload, retries=3)
+            return result.get("hash", "")
+        except FileNotFoundError:
+            raise
+        except Exception as e:
+            if "not found" in str(e).lower():
+                raise FileNotFoundError(f"File not found: {e}")
+            raise
 
     def write(self, path: JulesPath, data: bytes) -> bool:
         remote_path = self._get_remote_path(path)

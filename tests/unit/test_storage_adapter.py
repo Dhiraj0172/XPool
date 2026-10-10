@@ -79,29 +79,29 @@ def test_remote_path_mapping(adapter):
     assert exc.value.code == 403
 
 @respx.mock
-def test_read_success(adapter):
+def test_hash_success(adapter):
     import sys
     base = "C:/JulesWorkspace" if sys.platform == "win32" else "/JulesWorkspace"
     path = JulesPath(f"{base}/valid/path.txt")
-    # Using the core/command HTTP hook representation for rclone 'cat' which returns JSON
-    request = respx.post("http://localhost:5572/core/command").respond(
-        status_code=200, json={"out": "real_backend_content"}
+    request1 = respx.post("http://localhost:5572/operations/hashsumfile").respond(
+        status_code=200, json={"hash": "abcdef123"}
     )
-    content = adapter.read(path)
-    assert content == b"real_backend_content"
-    assert request.called
+    result = adapter.hash(path)
+    assert result == "abcdef123"
+    assert request1.called
 
 @respx.mock
-def test_read_not_found(adapter):
+def test_hash_not_found(adapter):
     import sys
     base = "C:/JulesWorkspace" if sys.platform == "win32" else "/JulesWorkspace"
     path = JulesPath(f"{base}/missing/path.txt")
-    request = respx.post("http://localhost:5572/core/command").respond(
-        status_code=500, json={"error": "directory not found"}
+    request1 = respx.post("http://localhost:5572/operations/hashsumfile").respond(
+        status_code=404, json={"error": "file not found"}
     )
+    import pytest
     with pytest.raises(FileNotFoundError):
-        adapter.read(path)
-    assert request.called
+        adapter.hash(path)
+    assert request1.called
 
 @respx.mock
 def test_stats_fallback(adapter):

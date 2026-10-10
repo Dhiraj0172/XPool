@@ -12,22 +12,35 @@ class MockStorageAdapter:
         self.write_fail = False
         self.corrupt_read_back = False
 
-    def read(self, path: JulesPath) -> bytes:
+    def hash(self, path: JulesPath, hash_type: str = "sha256") -> str:
         if self.read_fail:
             raise GatewayError("Backend down", code=502)
         if str(path.canonical_path) not in self.store:
             raise FileNotFoundError("Missing")
 
-        # Simulate corruption on the read-back verification step
         if self.corrupt_read_back and ".xpool_recovery" in str(path.canonical_path):
-            return b"corrupted_bytes"
+            return "corrupted_hash"
 
-        return self.store[str(path.canonical_path)]
+        import hashlib
+        return hashlib.sha256(self.store[str(path.canonical_path)]).hexdigest()
 
     def write(self, path: JulesPath, data: bytes) -> bool:
         if self.write_fail:
             return False
         self.store[str(path.canonical_path)] = data
+        return True
+
+    def copy(self, src: JulesPath, dst: JulesPath) -> bool:
+        if self.write_fail:
+            return False
+        if str(src.canonical_path) not in self.store:
+            raise FileNotFoundError("Missing")
+        self.store[str(dst.canonical_path)] = self.store[str(src.canonical_path)]
+        return True
+
+    def delete(self, path: JulesPath) -> bool:
+        if str(path.canonical_path) in self.store:
+            del self.store[str(path.canonical_path)]
         return True
 
 
@@ -77,7 +90,7 @@ def test_backup_write_failure_aborts(backup_mgr, root_path):
     with pytest.raises(BackupVerificationError) as exc:
         mgr.create_recovery_point(target)
 
-    assert "rejected backup write" in str(exc.value)
+    assert "rejected backup copy" in str(exc.value)
 
 
 def test_backup_integrity_mismatch_aborts(backup_mgr, root_path):
