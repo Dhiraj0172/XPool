@@ -9,9 +9,11 @@ description = "XPool + Google Jules Gateway System"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic==2.14.0",
+    "httpx>=0.28.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest==9.0.2",
+    "respx>=0.23.0",
 ]
