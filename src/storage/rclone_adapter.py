@@ -67,8 +67,11 @@ class RcloneRCAdapter:
     def _get_remote_path(self, path: JulesPath) -> str:
         """Converts the resolved canonical path back to a safe relative string for the backend"""
         try:
+            import pathlib
             # We strictly enforce that the path is within the Jules Zone Root
             rel_path = path.canonical_path.relative_to(self.jules_zone_root)
+            if rel_path == pathlib.Path("."):
+                raise GatewayError("Cannot target JULES_ZONE_ROOT itself", code=403)
         except ValueError:
             raise GatewayError("Path traversal prevented at storage layer", code=403)
 
@@ -79,7 +82,8 @@ class RcloneRCAdapter:
         remote_path = self._get_remote_path(path)
         cmd_payload = {"command": "cat", "arg": [f"{self.remote_name}{remote_path}"]}
         result = self._execute_rc("core/command", payload=cmd_payload, retries=3)
-        return result.get("_raw", b"")
+        # core/command returns a JSON dict with {"out": "..."} instead of raw bytes
+        return result.get("out", "").encode('utf-8')
 
     def write(self, path: JulesPath, data: bytes) -> bool:
         remote_path = self._get_remote_path(path)
@@ -120,7 +124,8 @@ class RcloneRCAdapter:
             "dstFs": self.remote_name,
             "dstRemote": self._get_remote_path(dst)
         }
-        self._execute_rc("operations/movefile", payload=payload, retries=3)
+        # Move is NOT idempotent. We must not blindly retry it.
+        self._execute_rc("operations/movefile", payload=payload, retries=0)
         return True
 
     def list(self, path: JulesPath) -> List[str]:

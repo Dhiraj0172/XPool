@@ -64,11 +64,18 @@ def test_remote_path_mapping(adapter):
     # Assert traversal escape is strictly blocked
     if sys.platform == "win32":
         bad_path = JulesPath("C:\\JulesWorkspace\\..\\Windows\\System32")
+        root_path = JulesPath("C:\\JulesWorkspace")
     else:
         bad_path = JulesPath("/JulesWorkspace/../etc/passwd")
+        root_path = JulesPath("/JulesWorkspace")
 
     with pytest.raises(GatewayError) as exc:
         adapter._get_remote_path(bad_path)
+    assert exc.value.code == 403
+
+    # Assert root zone protection is strictly blocked
+    with pytest.raises(GatewayError) as exc:
+        adapter._get_remote_path(root_path)
     assert exc.value.code == 403
 
 @respx.mock
@@ -76,9 +83,9 @@ def test_read_success(adapter):
     import sys
     base = "C:/JulesWorkspace" if sys.platform == "win32" else "/JulesWorkspace"
     path = JulesPath(f"{base}/valid/path.txt")
-    # Using the core/command HTTP hook representation for rclone 'cat'
+    # Using the core/command HTTP hook representation for rclone 'cat' which returns JSON
     request = respx.post("http://localhost:5572/core/command").respond(
-        status_code=200, content=b"real_backend_content", headers={"content-type": "application/octet-stream"}
+        status_code=200, json={"out": "real_backend_content"}
     )
     content = adapter.read(path)
     assert content == b"real_backend_content"
@@ -122,6 +129,13 @@ def test_copy_move(adapter):
     assert adapter.move(src, dst)
     assert req_copy.called
     assert req_move.called
+
+    # Verify move does NOT have retries enabled due to idempotency issues
+    req_move.mock(side_effect=httpx.RequestError("Network glitch"))
+    with pytest.raises(GatewayError):
+        adapter.move(src, dst)
+    # the route was called once initially successfully, and once failing just now. So call_count is 2 total.
+    assert req_move.call_count == 2
 
 @respx.mock
 def test_retry_logic(adapter):
