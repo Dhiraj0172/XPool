@@ -24,8 +24,12 @@ class JulesPath:
 
     @property
     def canonical_path(self) -> pathlib.Path:
-        # Resolves the path to prevent arbitrary traversal ('../') escapes
-        return pathlib.Path(self.raw_path).resolve()
+        # Resolves the path to prevent arbitrary traversal ('../') escapes.
+        # Enforce that the raw path string is not an absolute path trick bypassing the zone root entirely
+        # before we even attempt to relative_to() it at the adapter.
+        p = pathlib.Path(self.raw_path)
+        # Using strict=False guarantees symlinks don't cause FileNotFoundError during resolution of missing targets
+        return p.resolve(strict=False)
 
     def __str__(self) -> str:
         return str(self.canonical_path)

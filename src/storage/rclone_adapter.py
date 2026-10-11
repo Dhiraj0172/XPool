@@ -24,45 +24,45 @@ class RcloneRCAdapter:
             payload = {}
 
         attempt = 0
-        while attempt <= retries:
-            try:
-                with httpx.Client(timeout=25.0) as client:
+        with httpx.Client(timeout=25.0) as client:
+            while attempt <= retries:
+                try:
                     if files:
                         response = client.post(f"{self.rc_url}/{command}", data=payload, files=files)
                     else:
                         response = client.post(f"{self.rc_url}/{command}", json=payload)
 
-                response.raise_for_status()
+                    response.raise_for_status()
 
-                content_type = response.headers.get("content-type", "")
-                if "application/json" in content_type:
-                    return response.json()
-                return {"_raw": response.content}
+                    content_type = response.headers.get("content-type", "")
+                    if "application/json" in content_type:
+                        return response.json()
+                    return {"_raw": response.content}
 
-            except httpx.HTTPStatusError as exc:
-                error_msg = "Unknown rclone backend failure"
-                content_type = exc.response.headers.get("content-type", "")
-                if "application/json" in content_type:
-                    error_msg = exc.response.json().get("error", error_msg)
-                elif exc.response.text:
-                    error_msg = exc.response.text.strip()
+                except httpx.HTTPStatusError as exc:
+                    error_msg = "Unknown rclone backend failure"
+                    content_type = exc.response.headers.get("content-type", "")
+                    if "application/json" in content_type:
+                        error_msg = exc.response.json().get("error", error_msg)
+                    elif exc.response.text:
+                        error_msg = exc.response.text.strip()
 
-                # Quota limits and not-found should not be retried as transient
-                if "not found" in error_msg.lower() or exc.response.status_code == 404:
-                    raise FileNotFoundError(f"File not found: {error_msg}")
+                    # Quota limits and not-found should not be retried as transient
+                    if "not found" in error_msg.lower() or exc.response.status_code == 404:
+                        raise FileNotFoundError(f"File not found: {error_msg}")
 
-                if "quota" in error_msg.lower() or exc.response.status_code == 429:
-                    raise BackendQuotaError(f"Backend Quota Exceeded: {error_msg}")
+                    if "quota" in error_msg.lower() or exc.response.status_code == 429:
+                        raise BackendQuotaError(f"Backend Quota Exceeded: {error_msg}")
 
-                if attempt == retries:
-                    raise GatewayError(f"RC command {command} failed: {error_msg}", code=exc.response.status_code)
+                    if attempt == retries:
+                        raise GatewayError(f"RC command {command} failed: {error_msg}", code=exc.response.status_code)
 
-            except httpx.RequestError:
-                if attempt == retries:
-                    raise GatewayError(f"Connection to backend RC failed", code=502)
+                except httpx.RequestError:
+                    if attempt == retries:
+                        raise GatewayError(f"Connection to backend RC failed", code=502)
 
-            attempt += 1
-            time.sleep(2 ** attempt)
+                attempt += 1
+                time.sleep(2 ** attempt)
 
     def _get_remote_path(self, path: JulesPath) -> str:
         """Converts the resolved canonical path back to a safe relative string for the backend"""
@@ -72,6 +72,11 @@ class RcloneRCAdapter:
             rel_path = path.canonical_path.relative_to(self.jules_zone_root)
             if rel_path == pathlib.Path("."):
                 raise GatewayError("Cannot target JULES_ZONE_ROOT itself", code=403)
+
+            # Default-deny protection for .xpool_recovery namespace
+            if rel_path.parts and rel_path.parts[0] == ".xpool_recovery":
+                raise GatewayError("Cannot target protected recovery namespace", code=403)
+
         except ValueError:
             raise GatewayError("Path traversal prevented at storage layer", code=403)
 

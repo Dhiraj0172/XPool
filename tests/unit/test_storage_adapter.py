@@ -179,3 +179,16 @@ def test_delete_idempotent(adapter):
     # The adapter should swallow the 404/not found as success for idempotency
     assert adapter.delete(path) is True
     assert request.called
+
+def test_read_disabled_for_security():
+    from src.storage.rclone_adapter import RcloneRCAdapter
+    from src.common.types import JulesPath
+    adapter = RcloneRCAdapter()
+    with pytest.raises(NotImplementedError) as exc:
+        adapter.read(JulesPath("/JulesWorkspace/test.txt"))
+    assert "insecure and memory-bound" in str(exc.value)
+
+def test_calculate_sha256():
+    from src.dedup.cas import calculate_sha256
+    res = calculate_sha256(b"hello world")
+    assert res == "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"

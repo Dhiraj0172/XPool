@@ -35,3 +35,9 @@ class GatewayConfig(BaseModel):
     jules_zone_root: str
     # Fail closed on missing/invalid security settings
     require_auth: bool = True
+
+class CopyRequest(OperationRequest):
+    dst_path: str = Field(..., description="Target destination path")
+
+class MoveRequest(OperationRequest):
+    dst_path: str = Field(..., description="Target destination path")
