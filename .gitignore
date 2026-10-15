@@ -3,4 +3,10 @@ __pycache__/
 *$py.class
 .pytest_cache/
 x_drive/
-
+rclone*
+*.zip
+*.egg-info/
+src/*.egg-info/
+uv.lock
+*.bin
+!/.xpool_cloud_vault.bin

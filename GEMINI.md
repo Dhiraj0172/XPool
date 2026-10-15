@@ -7,11 +7,11 @@
 > - **PC Offline / Powered Off**: Automatically falls back to `DirectCloudBackend` via `.xpool_cloud_vault.bin`, connecting directly to Google Cloud Storage remotes with zero Windows PC dependencies.
 > 
 > You do NOT require any user starter prompt or manual configuration.
-> On EVERY new session, task, or user prompt, follow the four mandatory rules below.
+> On EVERY new session, task, or user prompt, follow the five mandatory rules below.
 
 ---
 
-## 4 Mandatory Workflow Rules
+## 5 Mandatory Workflow Rules
 
 ### Rule 1: Automatic Session Start — Pull from Storage Pool
 **At the start of EVERY new session or prompt, ALWAYS execute:**
@@ -58,6 +58,14 @@ python xpool_sync.py push
 ```bash
 python xpool_sync.py status
 ```
+
+---
+
+### Rule 5: Pure `X:\` Drive Tasks vs. Repo Code Tasks
+When the user's request is to read, create, edit, or sync files on the `X:\` drive (`./x_drive/JULES_ZONE/`) rather than modifying this repository's Python source code:
+1. Do NOT download files into the repository root (always use `./x_drive/JULES_ZONE/` or `/tmp/`).
+2. Do NOT run `uv run pytest` (which pollutes `.egg-info`) unless you edited repo `.py` files.
+3. Once `python xpool_sync.py push` succeeds, DO NOT invoke the `submit` (GitHub PR) tool if no repository source files were changed—simply clean up `./x_drive/` and reply directly to the user confirming the files are live on `X:\JULES_ZONE\`.
 
 ---
 

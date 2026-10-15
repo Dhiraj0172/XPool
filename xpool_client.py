@@ -166,16 +166,18 @@ class DirectCloudBackend:
                         break
             return str(bin_exe)
         else:
-            # Linux standalone download
+            # Linux standalone download strictly inside tempfile.gettempdir() (/tmp/xpool_bin)
+            tmp_bin_dir = Path(tempfile.gettempdir()) / "xpool_bin"
             candidates = [
-                "/tmp/xpool_bin/rclone",
-                os.path.expanduser("~/.local/bin/rclone")
+                tmp_bin_dir / "rclone",
+                Path("/tmp/xpool_bin/rclone"),
+                Path(os.path.expanduser("~/.local/bin/rclone"))
             ]
             for c in candidates:
-                if os.path.isfile(c) and os.access(c, os.X_OK):
-                    return c
+                if c.is_file() and os.access(c, os.X_OK):
+                    return str(c)
 
-            bin_dir = Path("/tmp/xpool_bin")
+            bin_dir = tmp_bin_dir
             bin_exe = bin_dir / "rclone"
             if bin_exe.is_file() and os.access(bin_exe, os.X_OK):
                 return str(bin_exe)
