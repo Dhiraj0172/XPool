@@ -52,7 +52,7 @@ def read_tunnel_url_file() -> Optional[str]:
     for candidate in candidates:
         if candidate.is_file():
             try:
-                with open(candidate, "r", encoding="utf-8") as f:
+                with open(candidate, "r", encoding="utf-8-sig") as f:
                     data = json.load(f)
                     url = data.get("tunnel_url") or data.get("url")
                     if url and isinstance(url, str) and url.startswith("http"):
@@ -125,7 +125,8 @@ class XPoolClient:
         data = None
         headers = {
             "Authorization": f"Bearer {self.token}",
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "X-Role": "jules_agent"
         }
         if json_body is not None:
             data = json.dumps(json_body).encode("utf-8")
