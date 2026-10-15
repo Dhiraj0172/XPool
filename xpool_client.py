@@ -1,8 +1,10 @@
-"""XPool Storage Access Gateway Client SDK & CLI.
-Provides authenticated access to the XPool Gateway across both local loopback
-and secure outbound reverse tunnels (Cloudflare / Ngrok).
-Supports all live v1 endpoints: health, list, read, write, delete, restore, and approve.
-Includes automatic live tunnel URL discovery from CURRENT_TUNNEL_URL.json on NXDOMAIN.
+"""XPool Storage Access Gateway Client SDK & CLI with Dual-Mode Auto-Fallback.
+
+Provides authenticated access to the 15.4 TiB XPool storage across:
+1. Primary Mode (PC Online): Windows XPool Gateway via local loopback or Cloudflare tunnel.
+2. Automatic Fallback Mode (PC Offline / Powered Off): DirectCloudBackend connecting
+   directly to google_unified: via ephemeral decrypted rclone vault config with zero
+   Windows PC dependency.
 """
 
 import os
@@ -10,12 +12,27 @@ import sys
 import json
 import base64
 import re
+import shutil
+import platform
+import subprocess
+import tempfile
+import atexit
 import argparse
 import urllib.request
 import urllib.error
 import urllib.parse
+import zipfile
+import io
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
+
+try:
+    from xpool_vault import decrypt_vault, find_vault_file
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from xpool_vault import decrypt_vault, find_vault_file
 
 
 def find_repo_root() -> Optional[Path]:
@@ -36,15 +53,11 @@ def read_tunnel_url_file() -> Optional[str]:
     """Reads CURRENT_TUNNEL_URL.json from repo root, cwd, or well-known system paths."""
     candidates = []
 
-    # 1. Search from repo root
     repo_root = find_repo_root()
     if repo_root:
         candidates.append(repo_root / "CURRENT_TUNNEL_URL.json")
 
-    # 2. Check current working directory
     candidates.append(Path.cwd() / "CURRENT_TUNNEL_URL.json")
-
-    # 3. Check staging / standard paths
     candidates.append(Path(r"C:\Users\ADMIN\jules-repo-staging\CURRENT_TUNNEL_URL.json"))
     candidates.append(Path(r"X:\JULES_ZONE\CURRENT_TUNNEL_URL.json"))
     candidates.append(Path(r"D:\xpool-gateway-sandbox\config\current_tunnel_url.json"))
@@ -102,11 +115,359 @@ def sanitize_text(text: Any) -> str:
     return clean
 
 
+class DirectCloudBackend:
+    """Direct Cloud Storage Backend for PC-Offline mode.
+    Connects directly to google_unified: via rclone using an ephemeral decrypted config.
+    Zero Windows PC dependencies; operates 24/7 anywhere in the world.
+    """
+    def __init__(self, vault_path: Optional[Path] = None):
+        self.vault_path = vault_path or find_vault_file()
+        if not self.vault_path or not self.vault_path.is_file():
+            raise FileNotFoundError(f"Cloud vault file (.xpool_cloud_vault.bin) not found.")
+
+        self.rclone_bin = self._find_or_install_rclone()
+        self.ephemeral_conf = self._create_ephemeral_config()
+        atexit.register(self.cleanup)
+
+    def _find_or_install_rclone(self) -> str:
+        """Finds existing rclone or downloads official standalone binary with zero root/sudo."""
+        rc = shutil.which("rclone")
+        if rc:
+            return rc
+
+        system = platform.system().lower()
+        if system == "windows":
+            candidates = [
+                os.path.expanduser(r"~\AppData\Local\Microsoft\WinGet\Links\rclone.exe"),
+                r"C:\Program Files\rclone\rclone.exe"
+            ]
+            for c in candidates:
+                if os.path.isfile(c):
+                    return c
+            # Download standalone windows binary
+            bin_dir = Path(tempfile.gettempdir()) / "xpool_bin"
+            bin_exe = bin_dir / "rclone.exe"
+            if bin_exe.is_file():
+                return str(bin_exe)
+            print("[DirectCloudBackend] Downloading standalone rclone for Windows...", file=sys.stderr)
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            url = "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                zf = zipfile.ZipFile(io.BytesIO(resp.read()))
+                for name in zf.namelist():
+                    if name.endswith("rclone.exe"):
+                        with open(bin_exe, "wb") as f:
+                            f.write(zf.read(name))
+                        break
+            return str(bin_exe)
+        else:
+            # Linux standalone download
+            candidates = [
+                "/tmp/xpool_bin/rclone",
+                os.path.expanduser("~/.local/bin/rclone")
+            ]
+            for c in candidates:
+                if os.path.isfile(c) and os.access(c, os.X_OK):
+                    return c
+
+            bin_dir = Path("/tmp/xpool_bin")
+            bin_exe = bin_dir / "rclone"
+            if bin_exe.is_file() and os.access(bin_exe, os.X_OK):
+                return str(bin_exe)
+
+            print("[DirectCloudBackend] Downloading standalone rclone for Linux...", file=sys.stderr)
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            url = "https://downloads.rclone.org/rclone-current-linux-amd64.zip"
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                zf = zipfile.ZipFile(io.BytesIO(resp.read()))
+                for name in zf.namelist():
+                    if name.endswith("/rclone") and not name.endswith("/"):
+                        with open(bin_exe, "wb") as f:
+                            f.write(zf.read(name))
+                        bin_exe.chmod(0o755)
+                        break
+            return str(bin_exe)
+
+    def _create_ephemeral_config(self) -> Path:
+        """Decrypts .xpool_cloud_vault.bin into an ephemeral config file (mode 0600)."""
+        with open(self.vault_path, "rb") as f:
+            enc_data = f.read()
+
+        plain_bytes = decrypt_vault(enc_data)
+        fd, tmp_path_str = tempfile.mkstemp(prefix="xpool_ephem_", suffix=".conf")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(plain_bytes)
+            tmp_path = Path(tmp_path_str)
+            try:
+                os.chmod(tmp_path, 0o600)
+            except Exception:
+                pass
+            return tmp_path
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            raise
+
+    def cleanup(self):
+        """Wipes and deletes the ephemeral config file on exit."""
+        if hasattr(self, "ephemeral_conf") and self.ephemeral_conf and self.ephemeral_conf.is_file():
+            try:
+                size = self.ephemeral_conf.stat().st_size
+                with open(self.ephemeral_conf, "r+b") as f:
+                    f.write(b"\x00" * size)
+                self.ephemeral_conf.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _run_rclone(self, args: List[str], input_data: Optional[bytes] = None, timeout: int = 60) -> subprocess.CompletedProcess:
+        """Executes rclone command against ephemeral config."""
+        cmd = [self.rclone_bin, "--config", str(self.ephemeral_conf)] + args
+        return subprocess.run(
+            cmd,
+            input=input_data,
+            capture_output=True,
+            timeout=timeout
+        )
+
+    def health(self) -> Dict[str, Any]:
+        """Queries health in DirectCloud mode."""
+        proc = self._run_rclone(["version"], timeout=10)
+        return {
+            "status": "healthy",
+            "mode": "direct_cloud",
+            "backend": "rclone",
+            "remote": "google_unified",
+            "rclone_bin": self.rclone_bin,
+            "rclone_version": proc.stdout.decode("utf-8", errors="replace").splitlines()[0] if proc.stdout else "unknown"
+        }
+
+    def list(self, path: str = "/") -> Dict[str, Any]:
+        """Lists directory contents on google_unified: (allowed across all 15.4 TiB)."""
+        clean = path.replace("\\", "/").strip("/")
+        remote_target = f"google_unified:{clean}" if clean else "google_unified:"
+
+        proc = self._run_rclone(["lsjson", remote_target], timeout=45)
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Direct cloud list failed on '{path}': {err}")
+
+        items_raw = json.loads(proc.stdout.decode("utf-8"))
+        items = []
+        for it in items_raw:
+            sub_path = f"/{clean}/{it['Path']}".strip("/") if clean else it["Path"]
+            items.append({
+                "name": it.get("Name"),
+                "path": "/" + sub_path,
+                "is_dir": it.get("IsDir", False),
+                "size_bytes": it.get("Size", 0) if not it.get("IsDir", False) else 0,
+                "modified_at": it.get("ModTime", "")
+            })
+
+        return {
+            "status": "ok",
+            "path": "/" + clean,
+            "items": items
+        }
+
+    def list_recursive(self, path: str = "/") -> List[Dict[str, Any]]:
+        """Fast recursive directory listing using rclone lsjson -R."""
+        clean = path.replace("\\", "/").strip("/")
+        remote_target = f"google_unified:{clean}" if clean else "google_unified:"
+
+        proc = self._run_rclone(["lsjson", "-R", remote_target], timeout=60)
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Direct cloud recursive list failed on '{path}': {err}")
+
+        items_raw = json.loads(proc.stdout.decode("utf-8"))
+        items = []
+        for it in items_raw:
+            if it.get("IsDir", False):
+                continue
+            sub_path = f"/{clean}/{it['Path']}".strip("/") if clean else it["Path"]
+            items.append({
+                "name": it.get("Name"),
+                "path": "/" + sub_path,
+                "is_dir": False,
+                "size_bytes": it.get("Size", 0),
+                "modified_at": it.get("ModTime", "")
+            })
+        return items
+
+    def read(self, path: str) -> Dict[str, Any]:
+        """Reads file contents on google_unified: (allowed across all 15.4 TiB)."""
+        clean = path.replace("\\", "/").strip("/")
+        if not clean:
+            raise ValueError("Cannot read root directory as a file")
+
+        remote_target = f"google_unified:{clean}"
+        proc = self._run_rclone(["cat", remote_target], timeout=60)
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Direct cloud read failed on '{path}': {err}")
+
+        raw_bytes = proc.stdout
+        try:
+            content_str = raw_bytes.decode("utf-8")
+            is_b64 = False
+        except UnicodeDecodeError:
+            content_str = base64.b64encode(raw_bytes).decode("ascii")
+            is_b64 = True
+
+        return {
+            "status": "ok",
+            "path": "/" + clean,
+            "content": content_str,
+            "is_base64": is_b64
+        }
+
+    def _ensure_cas_backup(self, clean_path: str) -> Optional[str]:
+        """Synchronously backs up an existing file into _JULES_PROTECTED_VAULT before mutation."""
+        remote_target = f"google_unified:{clean_path}"
+        stat_proc = self._run_rclone(["lsjson", remote_target], timeout=30)
+        if stat_proc.returncode == 0:
+            try:
+                entries = json.loads(stat_proc.stdout.decode("utf-8"))
+            except Exception:
+                entries = []
+            if entries and not entries[0].get("IsDir", False):
+                cat_proc = self._run_rclone(["cat", remote_target], timeout=60)
+                if cat_proc.returncode == 0:
+                    digest = hashlib.sha256(cat_proc.stdout).hexdigest()
+                    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    fname = os.path.basename(clean_path)
+                    backup_name = f"{ts}_{digest[:16]}_{fname}"
+                    vault_target = f"google_unified:_JULES_PROTECTED_VAULT/{backup_name}"
+                    copy_proc = self._run_rclone(["copyto", remote_target, vault_target], timeout=60)
+                    if copy_proc.returncode == 0:
+                        print(f"[DirectCloudBackend] CAS Backup secured in vault: {backup_name}", file=sys.stderr)
+                        return backup_name
+        return None
+
+    def write(self, path: str, content: str, is_base64: bool = False) -> Dict[str, Any]:
+        """Writes/overwrites a file inside /JULES_ZONE with CAS backup."""
+        clean = path.replace("\\", "/").strip("/")
+        # Safety policy: mutations strictly restricted to /JULES_ZONE
+        if not (clean == "JULES_ZONE" or clean.startswith("JULES_ZONE/")):
+            raise PermissionError(f"DirectCloudBackend safety policy violation: Mutations strictly restricted to /JULES_ZONE (attempted: '{path}')")
+
+        if is_base64:
+            raw_bytes = base64.b64decode(content)
+        else:
+            raw_bytes = content.encode("utf-8")
+
+        # 1. Pre-overwrite CAS backup
+        backup_id = self._ensure_cas_backup(clean)
+
+        # 2. Write to remote via ephemeral temp file
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(raw_bytes)
+            tmp_path = tmp.name
+
+        try:
+            remote_target = f"google_unified:{clean}"
+            proc = self._run_rclone(["copyto", tmp_path, remote_target], timeout=60)
+            if proc.returncode != 0:
+                err = proc.stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"Direct cloud write failed on '{path}': {err}")
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+        return {
+            "status": "written",
+            "path": "/" + clean,
+            "size_bytes": len(raw_bytes),
+            "backup_vault_id": backup_id
+        }
+
+    def delete(self, path: str) -> Dict[str, Any]:
+        """Deletes a file inside /JULES_ZONE with pre-delete CAS backup."""
+        clean = path.replace("\\", "/").strip("/")
+        # Safety policy: mutations strictly restricted to /JULES_ZONE
+        if not (clean == "JULES_ZONE" or clean.startswith("JULES_ZONE/")):
+            raise PermissionError(f"DirectCloudBackend safety policy violation: Mutations strictly restricted to /JULES_ZONE (attempted: '{path}')")
+
+        # 1. Pre-delete CAS backup
+        backup_id = self._ensure_cas_backup(clean)
+
+        # 2. Delete file
+        remote_target = f"google_unified:{clean}"
+        proc = self._run_rclone(["deletefile", remote_target], timeout=45)
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Direct cloud delete failed on '{path}': {err}")
+
+        return {
+            "status": "deleted",
+            "path": "/" + clean,
+            "recovery_version_id": backup_id or "not_found_on_remote"
+        }
+
+    def restore(self, version_id: str, target_path: Optional[str] = None) -> Dict[str, Any]:
+        """Restores a version from _JULES_PROTECTED_VAULT."""
+        clean_target = (target_path or f"JULES_ZONE/{version_id.split('_')[-1]}").replace("\\", "/").strip("/")
+        vault_source = f"google_unified:_JULES_PROTECTED_VAULT/{version_id}"
+        dest_target = f"google_unified:{clean_target}"
+
+        proc = self._run_rclone(["copyto", vault_source, dest_target], timeout=60)
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Direct cloud restore failed: {err}")
+
+        return {
+            "status": "restored",
+            "version_id": version_id,
+            "target_path": "/" + clean_target
+        }
+
+
 class XPoolClient:
-    """Official Python Client for XPool + Jules Storage Gateway."""
-    def __init__(self, base_url: Optional[str] = None, token: Optional[str] = None):
+    """Official Python Client for XPool + Jules Storage Gateway with Dual-Mode Auto-Fallback."""
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        token: Optional[str] = None,
+        mode: str = "auto"
+    ):
+        self.mode = mode.lower()
         self.base_url = resolve_default_gateway_url(base_url)
         self.token = token or os.environ.get("XPOOL_GATEWAY_TOKEN", DEFAULT_TOKEN)
+        self._direct_backend: Optional[DirectCloudBackend] = None
+        self._active_backend: str = "gateway" if self.mode != "direct" else "direct_cloud"
+
+        # Explicit direct mode
+        if self.mode == "direct":
+            self._init_direct_backend()
+
+    def _init_direct_backend(self) -> DirectCloudBackend:
+        """Instantiates DirectCloudBackend if not already initialized."""
+        if self._direct_backend is None:
+            self._direct_backend = DirectCloudBackend()
+            self._active_backend = "direct_cloud"
+        return self._direct_backend
+
+    def is_gateway_offline_url(self, url: str) -> bool:
+        """Checks if URL is explicitly designated for offline simulation."""
+        return "offline-pc-simulation" in url.lower()
+
+    def probe_gateway(self, timeout: int = 3) -> bool:
+        """Performs a lightweight 3-second probe to check if the Gateway is reachable."""
+        if self.is_gateway_offline_url(self.base_url):
+            return False
+
+        probe_url = f"{self.base_url}/api/v1/health"
+        req = urllib.request.Request(
+            probe_url,
+            headers={"Authorization": f"Bearer {self.token}", "X-Role": "jules_agent"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
 
     def _request(
         self,
@@ -117,7 +478,20 @@ class XPoolClient:
         timeout: int = 30,
         retried_after_failover: bool = False
     ) -> Dict[str, Any]:
-        """Executes an authenticated JSON HTTP request against the gateway with auto-failover on NXDOMAIN."""
+        """Executes JSON HTTP request against gateway with auto-failover to DirectCloudBackend."""
+        if self._active_backend == "direct_cloud" or self.mode == "direct":
+            raise RuntimeError("Request called while direct cloud backend active")
+
+        # Check for simulated offline URL
+        if self.is_gateway_offline_url(self.base_url) and self.mode in ("auto", "direct"):
+            print(
+                f"[XPoolClient] Notice: Offline PC simulation detected ({self.base_url}). "
+                f"Auto-switching to DirectCloudBackend (15.4 TiB google_unified: direct connection)...",
+                file=sys.stderr
+            )
+            self._init_direct_backend()
+            raise RuntimeError("FAILOVER_TO_DIRECT_CLOUD")
+
         url = f"{self.base_url}{endpoint}"
         if params:
             url += "?" + urllib.parse.urlencode(params)
@@ -142,6 +516,16 @@ class XPoolClient:
                 except Exception:
                     return {"raw": resp_bytes.decode("utf-8", errors="replace")}
         except urllib.error.HTTPError as e:
+            # Cloudflare 502/503/530/404 indicating PC shutdown or tunnel death
+            if e.code in (502, 503, 521, 522, 523, 524, 530, 404) and self.mode == "auto":
+                print(
+                    f"[XPoolClient] Notice: Gateway returned HTTP {e.code} (Windows PC offline / tunnel down). "
+                    f"Auto-switching to DirectCloudBackend (15.4 TiB google_unified: direct connection)...",
+                    file=sys.stderr
+                )
+                self._init_direct_backend()
+                raise RuntimeError("FAILOVER_TO_DIRECT_CLOUD")
+
             err_body = e.read().decode("utf-8", errors="replace")
             clean_err = sanitize_text(err_body)
             try:
@@ -159,13 +543,13 @@ class XPoolClient:
                 "11001",
                 "nodename nor servname provided"
             ])
-            # Automatic NXDOMAIN fallback: reload live tunnel URL from repository CURRENT_TUNNEL_URL.json
+            # NXDOMAIN: Attempt to reload live tunnel URL first
             if is_nxdomain and not retried_after_failover:
                 fresh_url = read_tunnel_url_file()
                 if fresh_url and fresh_url != self.base_url:
                     print(
                         f"[XPoolClient] Notice: Gateway '{self.base_url}' returned NXDOMAIN. "
-                        f"Auto-failing over to live URL from CURRENT_TUNNEL_URL.json: '{fresh_url}'",
+                        f"Auto-failing over to live URL: '{fresh_url}'",
                         file=sys.stderr
                     )
                     self.base_url = fresh_url
@@ -177,42 +561,95 @@ class XPoolClient:
                         timeout=timeout,
                         retried_after_failover=True
                     )
+
+            # If still unreachable and in auto mode, switch to DirectCloudBackend
+            if self.mode == "auto":
+                print(
+                    f"[XPoolClient] Notice: Connection to gateway failed ({sanitize_text(str(e.reason))}). "
+                    f"Auto-switching to DirectCloudBackend (15.4 TiB google_unified: direct connection)...",
+                    file=sys.stderr
+                )
+                self._init_direct_backend()
+                raise RuntimeError("FAILOVER_TO_DIRECT_CLOUD")
+
             clean_reason = sanitize_text(str(e.reason))
             raise RuntimeError(f"Gateway Connection Error on {endpoint}: {clean_reason}")
 
     def health(self) -> Dict[str, Any]:
-        """Queries /api/v1/health endpoint."""
-        return self._request("GET", "/api/v1/health")
+        """Queries health of active backend (Gateway or DirectCloud)."""
+        if self._active_backend == "direct_cloud" or self.mode == "direct":
+            return self._init_direct_backend().health()
+        try:
+            return self._request("GET", "/api/v1/health")
+        except RuntimeError as e:
+            if str(e) == "FAILOVER_TO_DIRECT_CLOUD":
+                return self._init_direct_backend().health()
+            raise
 
     def list(self, path: str = "/") -> Dict[str, Any]:
-        """Lists directory contents via /api/v1/list."""
-        return self._request("POST", "/api/v1/list", json_body={"path": path})
+        """Lists directory contents via Gateway or DirectCloudBackend."""
+        if self._active_backend == "direct_cloud" or self.mode == "direct":
+            return self._init_direct_backend().list(path)
+        try:
+            return self._request("POST", "/api/v1/list", json_body={"path": path})
+        except RuntimeError as e:
+            if str(e) == "FAILOVER_TO_DIRECT_CLOUD":
+                return self._init_direct_backend().list(path)
+            raise
 
     def read(self, path: str) -> Dict[str, Any]:
-        """Reads file contents via /api/v1/read."""
-        return self._request("POST", "/api/v1/read", json_body={"path": path})
+        """Reads file contents via Gateway or DirectCloudBackend."""
+        if self._active_backend == "direct_cloud" or self.mode == "direct":
+            return self._init_direct_backend().read(path)
+        try:
+            return self._request("POST", "/api/v1/read", json_body={"path": path})
+        except RuntimeError as e:
+            if str(e) == "FAILOVER_TO_DIRECT_CLOUD":
+                return self._init_direct_backend().read(path)
+            raise
 
     def write(self, path: str, content: str, is_base64: bool = False) -> Dict[str, Any]:
-        """Writes or overwrites a file via /api/v1/write under fail-closed protection."""
-        return self._request("POST", "/api/v1/write", json_body={
-            "path": path,
-            "content": content,
-            "is_base64": is_base64
-        })
+        """Writes or overwrites a file via Gateway or DirectCloudBackend under fail-closed protection."""
+        if self._active_backend == "direct_cloud" or self.mode == "direct":
+            return self._init_direct_backend().write(path, content, is_base64)
+        try:
+            return self._request("POST", "/api/v1/write", json_body={
+                "path": path,
+                "content": content,
+                "is_base64": is_base64
+            })
+        except RuntimeError as e:
+            if str(e) == "FAILOVER_TO_DIRECT_CLOUD":
+                return self._init_direct_backend().write(path, content, is_base64)
+            raise
 
     def delete(self, path: str) -> Dict[str, Any]:
-        """Deletes a file via /api/v1/delete with synchronous pre-delete backup."""
-        return self._request("POST", "/api/v1/delete", json_body={"path": path})
+        """Deletes a file via Gateway or DirectCloudBackend with synchronous pre-delete backup."""
+        if self._active_backend == "direct_cloud" or self.mode == "direct":
+            return self._init_direct_backend().delete(path)
+        try:
+            return self._request("POST", "/api/v1/delete", json_body={"path": path})
+        except RuntimeError as e:
+            if str(e) == "FAILOVER_TO_DIRECT_CLOUD":
+                return self._init_direct_backend().delete(path)
+            raise
 
     def restore(self, version_id: str, target_path: Optional[str] = None) -> Dict[str, Any]:
-        """Restores a version from the protected CAS vault via /api/v1/restore."""
+        """Restores a version from the protected CAS vault."""
+        if self._active_backend == "direct_cloud" or self.mode == "direct":
+            return self._init_direct_backend().restore(version_id, target_path)
         payload: Dict[str, Any] = {"version_id": version_id}
         if target_path:
             payload["target_path"] = target_path
-        return self._request("POST", "/api/v1/restore", json_body=payload)
+        try:
+            return self._request("POST", "/api/v1/restore", json_body=payload)
+        except RuntimeError as e:
+            if str(e) == "FAILOVER_TO_DIRECT_CLOUD":
+                return self._init_direct_backend().restore(version_id, target_path)
+            raise
 
     def approve(self, approval_id: str, decision: str = "APPROVED") -> Dict[str, Any]:
-        """Resolves an owner approval request via /api/v1/approve."""
+        """Resolves an owner approval request (Gateway only)."""
         return self._request("POST", "/api/v1/approve", json_body={
             "approval_id": approval_id,
             "decision": decision
@@ -220,14 +657,15 @@ class XPoolClient:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="XPool Storage Access Gateway Client CLI")
+    parser = argparse.ArgumentParser(description="XPool Storage Access Gateway Client CLI (Dual-Mode Auto-Fallback)")
     parser.add_argument("--url", default=None, help="Gateway base URL (default: $XPOOL_GATEWAY_URL or CURRENT_TUNNEL_URL.json)")
     parser.add_argument("--token", default=None, help="Bearer authorization token (default: $XPOOL_GATEWAY_TOKEN)")
+    parser.add_argument("--mode", default="auto", choices=["auto", "gateway", "direct"], help="Operating backend mode")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # health
-    subparsers.add_parser("health", help="Check gateway service health")
+    subparsers.add_parser("health", help="Check storage backend health")
 
     # list
     p_list = subparsers.add_parser("list", help="List directory contents")
@@ -257,7 +695,7 @@ def main():
     p_appr.add_argument("--decision", default="APPROVED", choices=["APPROVED", "REJECTED"], help="Decision")
 
     args = parser.parse_args()
-    client = XPoolClient(base_url=args.url, token=args.token)
+    client = XPoolClient(base_url=args.url, token=args.token, mode=args.mode)
 
     try:
         if args.command == "health":

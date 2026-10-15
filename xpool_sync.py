@@ -1,9 +1,13 @@
 r"""XPool Storage Sync Utility (Git-style Auto-Pull / Auto-Fetch / Auto-Push).
-Bridges Google Jules workspace directly to the user's 15.4 TiB Windows X:\ drive (google_unified:).
-Supports:
-  - pull:  Indexes the root pool and syncs /JULES_ZONE into ./x_drive/JULES_ZONE/
-  - fetch: Pulls read-only files or folders from anywhere in the 15.4 TiB pool
-  - push:  Synchronizes local edits/deletions in ./x_drive/JULES_ZONE back to live X:\JULES_ZONE
+Bridges Google Jules workspace directly to the 15.4 TiB cloud storage pool (google_unified:).
+Supports Dual-Mode Operation:
+  - Online Mode: Windows XPool Gateway via Cloudflare tunnel.
+  - Offline Mode: Direct Cloud connection (google_unified:) via ephemeral decrypted vault.
+
+Commands:
+  - pull:   Indexes the root pool and syncs /JULES_ZONE into ./x_drive/JULES_ZONE/
+  - fetch:  Pulls read-only files or folders from anywhere in the 15.4 TiB pool
+  - push:   Synchronizes local edits/deletions in ./x_drive/JULES_ZONE back to live storage
   - status: Shows pending changes compared to the baseline sync manifest
 """
 
@@ -19,7 +23,6 @@ from typing import Dict, Any, List, Optional, Tuple, Set
 try:
     from xpool_client import XPoolClient, sanitize_text
 except ImportError:
-    # Handle direct import if running within module path
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from xpool_client import XPoolClient, sanitize_text
 
@@ -98,17 +101,39 @@ def save_manifest(manifest_path: Path, files_map: Dict[str, Any], extra_meta: Op
 
 
 class XPoolSyncManager:
-    r"""Manages bidirectional file synchronization between local workspace and live X:\ pool."""
-    def __init__(self, workspace_root: Optional[Path] = None, client: Optional[XPoolClient] = None):
+    r"""Manages bidirectional file synchronization between local workspace and live storage pool."""
+    def __init__(
+        self,
+        workspace_root: Optional[Path] = None,
+        client: Optional[XPoolClient] = None,
+        mode: str = "auto"
+    ):
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.x_drive_dir = self.workspace_root / DEFAULT_SYNC_ROOT
         self.jules_zone_dir = self.x_drive_dir / "JULES_ZONE"
         self.manifest_path = self.x_drive_dir / MANIFEST_FILENAME
         self.index_path = self.x_drive_dir / INDEX_FILENAME
-        self.client = client or XPoolClient()
+        self.client = client or XPoolClient(mode=mode)
+
+    def _ensure_connected(self):
+        """Probes gateway availability and prepares backend connection."""
+        if self.client.mode == "auto" and self.client._active_backend != "direct_cloud":
+            if self.client.probe_gateway(timeout=2):
+                print(f"[xpool_sync] Connecting to Windows XPool Gateway: {self.client.base_url}")
+            else:
+                print(f"[xpool_sync] Windows PC Gateway offline / unreachable. Connecting to Direct Cloud Pool (google_unified:)...")
+                self.client._init_direct_backend()
+        elif self.client._active_backend == "direct_cloud" or self.client.mode == "direct":
+            print(f"[xpool_sync] Operating in Direct Cloud Pool mode (google_unified:)")
+        else:
+            print(f"[xpool_sync] Connecting to XPool Gateway: {self.client.base_url}")
 
     def list_recursive(self, remote_dir: str) -> List[Dict[str, Any]]:
-        """Recursively lists all files under a remote directory using the gateway list API."""
+        """Recursively lists all files under a remote directory."""
+        # Fast path if DirectCloudBackend is active
+        if self.client._active_backend == "direct_cloud" and self.client._direct_backend:
+            return self.client._direct_backend.list_recursive(remote_dir)
+
         norm_dir = "/" + remote_dir.strip("/\\")
         files = []
         dirs_queue = [norm_dir]
@@ -135,19 +160,21 @@ class XPoolSyncManager:
         self.x_drive_dir.mkdir(parents=True, exist_ok=True)
         self.jules_zone_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"[xpool_sync] Connecting to XPool Gateway: {self.client.base_url}")
+        self._ensure_connected()
 
         # 1. Index Root Directory (15.4 TiB Pool Map)
         try:
             root_res = self.client.list("/")
+            backend_label = self.client._active_backend
             with open(self.index_path, "w", encoding="utf-8") as f:
                 json.dump({
                     "synced_at": root_res.get("synced_at") or "",
-                    "gateway_url": self.client.base_url,
+                    "backend_mode": backend_label,
+                    "endpoint": self.client.base_url if backend_label == "gateway" else "google_unified:",
                     "pool_root": "/",
                     "items": root_res.get("items", [])
                 }, f, indent=2)
-            print(f"[xpool_sync] Updated live pool index: {self.index_path.relative_to(self.workspace_root)}")
+            print(f"[xpool_sync] Updated live pool index: {self.index_path.relative_to(self.workspace_root)} ({backend_label})")
         except Exception as e:
             print(f"[xpool_sync] Warning: Could not index root directory: {e}", file=sys.stderr)
 
@@ -162,19 +189,16 @@ class XPoolSyncManager:
 
         for rfile in remote_files:
             rpath = rfile["path"]
-            # Rel path inside JULES_ZONE
-            rel_path = rpath[len("/JULES_ZONE/"):].lstrip("/\\")
+            # Relative path inside JULES_ZONE
+            rel_path = rpath[len("/JULES_ZONE/"):].lstrip("/\\") if rpath.startswith("/JULES_ZONE/") else rpath.lstrip("/\\")
             if not rel_path:
                 continue
 
             local_target = self.jules_zone_dir / rel_path
-            expected_size = rfile.get("size_bytes", 0)
-
             needs_download = True
             if local_target.is_file():
                 local_sha, local_size = compute_file_sha256(local_target)
                 if rel_path in manifest and manifest[rel_path].get("sha256") == local_sha:
-                    # File matches baseline manifest
                     needs_download = False
                     updated_manifest[rel_path] = {
                         "sha256": local_sha,
@@ -216,14 +240,14 @@ class XPoolSyncManager:
     def fetch(self, remote_path: str) -> Dict[str, Any]:
         """Fetches any read-only file or folder from anywhere in the 15.4 TiB pool into ./x_drive/."""
         clean_path = "/" + remote_path.strip("/\\")
-        print(f"[xpool_sync] Fetching '{clean_path}' from XPool Gateway...")
+        self._ensure_connected()
+        print(f"[xpool_sync] Fetching '{clean_path}'...")
 
         # Check if remote_path is a directory
         is_dir = False
         try:
             list_res = self.client.list(clean_path)
             items = list_res.get("items", [])
-            # If list returns items and does not equal a single file with matching path
             if len(items) > 1 or (len(items) == 1 and items[0].get("is_dir")):
                 is_dir = True
             elif len(items) == 1 and items[0].get("path") == clean_path and not items[0].get("is_dir"):
@@ -231,7 +255,6 @@ class XPoolSyncManager:
             else:
                 is_dir = True
         except Exception:
-            # Fall back to file read
             is_dir = False
 
         fetched_files = []
@@ -280,7 +303,6 @@ class XPoolSyncManager:
         modified = []
         current_local_files: Set[str] = set()
 
-        # Scan local directory
         for root, dirs, files in os.walk(self.jules_zone_dir):
             for fname in files:
                 fpath = Path(root) / fname
@@ -306,7 +328,7 @@ class XPoolSyncManager:
         }
 
     def push(self) -> Dict[str, Any]:
-        r"""Pushes created/modified files in ./x_drive/JULES_ZONE and removes deleted files on live X:\."""
+        r"""Pushes created/modified files in ./x_drive/JULES_ZONE and removes deleted files on live storage."""
         if not self.jules_zone_dir.is_dir():
             print("[xpool_sync] No local JULES_ZONE directory found. Nothing to push.")
             return {"created": 0, "modified": 0, "deleted": 0}
@@ -318,10 +340,12 @@ class XPoolSyncManager:
 
         total_changes = len(created) + len(modified) + len(deleted)
         if total_changes == 0:
-            print("[xpool_sync] Everything up to date with live X:\\JULES_ZONE. No changes to push.")
+            print("[xpool_sync] Everything up to date with live storage. No changes to push.")
             return {"created": 0, "modified": 0, "deleted": 0}
 
-        print(f"[xpool_sync] Pushing {total_changes} changes to live X:\\JULES_ZONE via {self.client.base_url}...")
+        self._ensure_connected()
+        backend_name = self.client._active_backend
+        print(f"[xpool_sync] Pushing {total_changes} changes to live storage ({backend_name})...")
 
         manifest = load_manifest(self.manifest_path)
         updated_manifest = dict(manifest)
@@ -335,7 +359,6 @@ class XPoolSyncManager:
                 data = f.read()
 
             try:
-                # Attempt UTF-8 decode; fallback to base64 for binary files
                 content_str = data.decode("utf-8")
                 is_b64 = False
             except UnicodeDecodeError:
@@ -352,7 +375,8 @@ class XPoolSyncManager:
                     "remote_path": remote_path
                 }
                 symbol = "+" if action_label == "create" else "*"
-                print(f"  {symbol} {action_label}: JULES_ZONE/{rel_path} ({file_size} bytes)")
+                backup_info = f" (backup: {res.get('backup_vault_id')})" if res.get('backup_vault_id') else ""
+                print(f"  {symbol} {action_label}: JULES_ZONE/{rel_path} ({file_size} bytes){backup_info}")
             except Exception as e:
                 print(f"[xpool_sync] Failed to push '{remote_path}': {e}", file=sys.stderr)
 
@@ -378,8 +402,9 @@ class XPoolSyncManager:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="XPool Storage Sync Utility: Git-style sync tool for live Windows X:\\ drive"
+        description="XPool Storage Sync Utility: 24/7 Git-style sync tool for 15.4 TiB pool (Online Gateway + Offline Direct Cloud)"
     )
+    parser.add_argument("--mode", default="auto", choices=["auto", "gateway", "direct"], help="Operating backend mode")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # pull
@@ -390,13 +415,13 @@ def main():
     p_fetch.add_argument("remote_path", help="Canonical remote path (e.g. /AI-MEMORY/notes.txt or /SHARED_READONLY)")
 
     # push
-    subparsers.add_parser("push", help="Push all created, modified, and deleted files in ./x_drive/JULES_ZONE back to live X:\\")
+    subparsers.add_parser("push", help="Push all created, modified, and deleted files in ./x_drive/JULES_ZONE back to live storage")
 
     # status
     subparsers.add_parser("status", help="Show working tree status comparing ./x_drive/JULES_ZONE to baseline manifest")
 
     args = parser.parse_args()
-    manager = XPoolSyncManager()
+    manager = XPoolSyncManager(mode=args.mode)
 
     try:
         if args.command == "pull":
