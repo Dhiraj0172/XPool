@@ -17,6 +17,8 @@ import json
 import base64
 import hashlib
 import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Set
 
@@ -187,6 +189,7 @@ class XPoolSyncManager:
 
         print(f"[xpool_sync] Syncing /JULES_ZONE ({len(remote_files)} remote entries found)...")
 
+        files_to_download: List[Tuple[str, str]] = []
         for rfile in remote_files:
             rpath = rfile["path"]
             # Relative path inside JULES_ZONE
@@ -207,31 +210,90 @@ class XPoolSyncManager:
                     }
 
             if needs_download:
-                try:
-                    read_res = self.client.read(rpath)
+                files_to_download.append((rel_path, rpath))
+
+        if not files_to_download:
+            save_manifest(self.manifest_path, updated_manifest)
+            print(f"[xpool_sync] Pull complete: 0 files synced (all up to date).")
+            return {"pulled_count": 0, "total_bytes": 0}
+
+        # Concurrency & High-Speed Batching
+        if self.client._active_backend == "direct_cloud" and self.client._direct_backend:
+            # High-speed bulk rclone download with --transfers 16 --checkers 32 --fast-list
+            rel_list = [rel for rel, _ in files_to_download]
+            try:
+                print(f"[xpool_sync] Executing bulk cloud download ({len(rel_list)} files, --transfers 16 --checkers 32 --fast-list)...")
+                self.client._direct_backend.bulk_copy_from_cloud(
+                    local_base=self.jules_zone_dir,
+                    rel_paths=rel_list,
+                    remote_prefix="JULES_ZONE"
+                )
+                for rel_path, rpath in files_to_download:
+                    local_target = self.jules_zone_dir / rel_path
+                    if local_target.is_file():
+                        local_sha, local_size = compute_file_sha256(local_target)
+                        updated_manifest[rel_path] = {
+                            "sha256": local_sha,
+                            "size_bytes": local_size,
+                            "remote_path": rpath
+                        }
+                        pulled_count += 1
+                        total_bytes += local_size
+                        print(f"  + pulled: JULES_ZONE/{rel_path} ({local_size} bytes)")
+            except Exception as bulk_err:
+                print(f"[xpool_sync] Notice: Bulk pull failed ({bulk_err}), falling back to ThreadPoolExecutor(max_workers=8)...", file=sys.stderr)
+                def _dl_worker(item: Tuple[str, str]):
+                    r_rel, r_rpath = item
+                    dest = self.jules_zone_dir / r_rel
+                    read_res = self.client.read(r_rpath)
                     content_raw = read_res.get("content", "")
-                    is_b64 = read_res.get("is_base64", False)
+                    b = base64.b64decode(content_raw) if read_res.get("is_base64") else content_raw.encode("utf-8")
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with open(dest, "wb") as f:
+                        f.write(b)
+                    return r_rel, r_rpath, hashlib.sha256(b).hexdigest(), len(b)
 
-                    if is_b64:
-                        file_bytes = base64.b64decode(content_raw)
-                    else:
-                        file_bytes = content_raw.encode("utf-8")
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = [executor.submit(_dl_worker, it) for it in files_to_download]
+                    for fut in as_completed(futures):
+                        try:
+                            r_rel, r_rpath, sha, sz = fut.result()
+                            updated_manifest[r_rel] = {"sha256": sha, "size_bytes": sz, "remote_path": r_rpath}
+                            pulled_count += 1
+                            total_bytes += sz
+                            print(f"  + pulled: JULES_ZONE/{r_rel} ({sz} bytes)")
+                        except Exception as e:
+                            print(f"[xpool_sync] Error pulling file: {e}", file=sys.stderr)
+        else:
+            # GatewayBackend mode: ThreadPoolExecutor(max_workers=6)
+            print(f"[xpool_sync] Pulling {len(files_to_download)} files via Gateway (ThreadPoolExecutor max_workers=6)...")
+            manifest_lock = threading.Lock()
 
-                    local_target.parent.mkdir(parents=True, exist_ok=True)
-                    with open(local_target, "wb") as f:
-                        f.write(file_bytes)
+            def _gateway_dl_worker(item: Tuple[str, str]):
+                r_rel, r_rpath = item
+                dest = self.jules_zone_dir / r_rel
+                read_res = self.client.read(r_rpath)
+                content_raw = read_res.get("content", "")
+                b = base64.b64decode(content_raw) if read_res.get("is_base64") else content_raw.encode("utf-8")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with open(dest, "wb") as f:
+                    f.write(b)
+                sha = hashlib.sha256(b).hexdigest()
+                sz = len(b)
+                with manifest_lock:
+                    updated_manifest[r_rel] = {"sha256": sha, "size_bytes": sz, "remote_path": r_rpath}
+                return r_rel, sz
 
-                    file_sha = hashlib.sha256(file_bytes).hexdigest()
-                    updated_manifest[rel_path] = {
-                        "sha256": file_sha,
-                        "size_bytes": len(file_bytes),
-                        "remote_path": rpath
-                    }
-                    pulled_count += 1
-                    total_bytes += len(file_bytes)
-                    print(f"  + pulled: JULES_ZONE/{rel_path} ({len(file_bytes)} bytes)")
-                except Exception as e:
-                    print(f"[xpool_sync] Error pulling '{rpath}': {e}", file=sys.stderr)
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                futures = [executor.submit(_gateway_dl_worker, it) for it in files_to_download]
+                for fut in as_completed(futures):
+                    try:
+                        r_rel, sz = fut.result()
+                        pulled_count += 1
+                        total_bytes += sz
+                        print(f"  + pulled: JULES_ZONE/{r_rel} ({sz} bytes)")
+                    except Exception as e:
+                        print(f"[xpool_sync] Error pulling file: {e}", file=sys.stderr)
 
         save_manifest(self.manifest_path, updated_manifest)
         print(f"[xpool_sync] Pull complete: {pulled_count} files synced ({total_bytes} bytes).")
@@ -260,22 +322,27 @@ class XPoolSyncManager:
         fetched_files = []
         if is_dir:
             remote_files = self.list_recursive(clean_path)
-            for rfile in remote_files:
+            def _fetch_worker(rfile):
                 rpath = rfile["path"]
                 rel_from_root = rpath.lstrip("/\\")
                 local_dest = self.x_drive_dir / rel_from_root
+                read_res = self.client.read(rpath)
+                content_raw = read_res.get("content", "")
+                file_bytes = base64.b64decode(content_raw) if read_res.get("is_base64") else content_raw.encode("utf-8")
+                local_dest.parent.mkdir(parents=True, exist_ok=True)
+                with open(local_dest, "wb") as f:
+                    f.write(file_bytes)
+                return {"path": str(local_dest), "size": len(file_bytes), "rel": rel_from_root}
 
-                try:
-                    read_res = self.client.read(rpath)
-                    content_raw = read_res.get("content", "")
-                    file_bytes = base64.b64decode(content_raw) if read_res.get("is_base64") else content_raw.encode("utf-8")
-                    local_dest.parent.mkdir(parents=True, exist_ok=True)
-                    with open(local_dest, "wb") as f:
-                        f.write(file_bytes)
-                    fetched_files.append({"path": str(local_dest), "size": len(file_bytes)})
-                    print(f"  + fetched: {rel_from_root} ({len(file_bytes)} bytes)")
-                except Exception as e:
-                    print(f"[xpool_sync] Error fetching '{rpath}': {e}", file=sys.stderr)
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(_fetch_worker, rf) for rf in remote_files]
+                for fut in as_completed(futures):
+                    try:
+                        res = fut.result()
+                        fetched_files.append({"path": res["path"], "size": res["size"]})
+                        print(f"  + fetched: {res['rel']} ({res['size']} bytes)")
+                    except Exception as e:
+                        print(f"[xpool_sync] Error fetching file: {e}", file=sys.stderr)
         else:
             rel_from_root = clean_path.lstrip("/\\")
             local_dest = self.x_drive_dir / rel_from_root
@@ -350,53 +417,172 @@ class XPoolSyncManager:
         manifest = load_manifest(self.manifest_path)
         updated_manifest = dict(manifest)
 
-        # 1. Upload Created and Modified Files
-        for rel_path in (created + modified):
-            local_path = self.jules_zone_dir / rel_path
-            remote_path = f"/JULES_ZONE/{rel_path}"
+        manifest_lock = threading.Lock()
+        success_created = 0
+        success_modified = 0
+        success_deleted = 0
 
-            with open(local_path, "rb") as f:
-                data = f.read()
+        if self.client._active_backend == "direct_cloud" and self.client._direct_backend:
+            # 1. High-speed bulk CAS backup pass to google_unified:_JULES_PROTECTED_VAULT/
+            to_backup_rel = [p for p in (modified + deleted)]
+            if to_backup_rel:
+                print(f"[xpool_sync] Running high-speed CAS backup pass for {len(to_backup_rel)} target files...")
+                backup_results = self.client._direct_backend.bulk_cas_backup(to_backup_rel, remote_prefix="JULES_ZONE")
+                backed_up_count = sum(1 for v in backup_results.values() if v)
+                print(f"[xpool_sync] CAS backup pass complete: {backed_up_count} existing versions secured in vault.")
 
-            try:
-                content_str = data.decode("utf-8")
-                is_b64 = False
-            except UnicodeDecodeError:
-                content_str = base64.b64encode(data).decode("ascii")
-                is_b64 = True
+            # 2. Bulk upload created and modified files
+            uploads = created + modified
+            if uploads:
+                print(f"[xpool_sync] Executing bulk cloud upload ({len(uploads)} files, --transfers 16 --checkers 32 --fast-list)...")
+                try:
+                    self.client._direct_backend.bulk_copy_to_cloud(
+                        local_base=self.jules_zone_dir,
+                        rel_paths=uploads,
+                        remote_prefix="JULES_ZONE"
+                    )
+                    for rel_path in uploads:
+                        local_path = self.jules_zone_dir / rel_path
+                        file_sha, file_size = compute_file_sha256(local_path)
+                        remote_path = f"/JULES_ZONE/{rel_path}"
+                        updated_manifest[rel_path] = {
+                            "sha256": file_sha,
+                            "size_bytes": file_size,
+                            "remote_path": remote_path
+                        }
+                        if rel_path in created:
+                            success_created += 1
+                            print(f"  + create: JULES_ZONE/{rel_path} ({file_size} bytes)")
+                        else:
+                            success_modified += 1
+                            print(f"  * update: JULES_ZONE/{rel_path} ({file_size} bytes)")
+                except Exception as upload_err:
+                    print(f"[xpool_sync] Notice: Bulk upload failed ({upload_err}), falling back to ThreadPoolExecutor(max_workers=8)...", file=sys.stderr)
+                    def _up_worker(rel_p):
+                        loc_p = self.jules_zone_dir / rel_p
+                        rem_p = f"/JULES_ZONE/{rel_p}"
+                        with open(loc_p, "rb") as f:
+                            d = f.read()
+                        try:
+                            c_str = d.decode("utf-8")
+                            b64 = False
+                        except UnicodeDecodeError:
+                            c_str = base64.b64encode(d).decode("ascii")
+                            b64 = True
+                        res = self.client.write(path=rem_p, content=c_str, is_base64=b64)
+                        f_sha, f_sz = compute_file_sha256(loc_p)
+                        return rel_p, rem_p, f_sha, f_sz, res.get("backup_vault_id")
 
-            action_label = "create" if rel_path in created else "update"
-            try:
-                res = self.client.write(path=remote_path, content=content_str, is_base64=is_b64)
-                file_sha, file_size = compute_file_sha256(local_path)
-                updated_manifest[rel_path] = {
-                    "sha256": file_sha,
-                    "size_bytes": file_size,
-                    "remote_path": remote_path
-                }
-                symbol = "+" if action_label == "create" else "*"
-                backup_info = f" (backup: {res.get('backup_vault_id')})" if res.get('backup_vault_id') else ""
-                print(f"  {symbol} {action_label}: JULES_ZONE/{rel_path} ({file_size} bytes){backup_info}")
-            except Exception as e:
-                print(f"[xpool_sync] Failed to push '{remote_path}': {e}", file=sys.stderr)
+                    with ThreadPoolExecutor(max_workers=8) as executor:
+                        futs = [executor.submit(_up_worker, p) for p in uploads]
+                        for fut in as_completed(futs):
+                            try:
+                                rel_p, rem_p, sha, sz, b_id = fut.result()
+                                updated_manifest[rel_p] = {"sha256": sha, "size_bytes": sz, "remote_path": rem_p}
+                                if rel_p in created:
+                                    success_created += 1
+                                    print(f"  + create: JULES_ZONE/{rel_p} ({sz} bytes)")
+                                else:
+                                    success_modified += 1
+                                    print(f"  * update: JULES_ZONE/{rel_p} ({sz} bytes)")
+                            except Exception as e:
+                                print(f"[xpool_sync] Failed to push file: {e}", file=sys.stderr)
 
-        # 2. Delete Removed Files (with synchronous pre-delete backup in CAS vault)
-        for rel_path in deleted:
-            remote_path = f"/JULES_ZONE/{rel_path}"
-            try:
-                res = self.client.delete(path=remote_path)
-                if rel_path in updated_manifest:
-                    del updated_manifest[rel_path]
-                print(f"  - delete: JULES_ZONE/{rel_path} (protected in vault: {res.get('recovery_version_id', 'yes')})")
-            except Exception as e:
-                print(f"[xpool_sync] Failed to delete remote '{remote_path}': {e}", file=sys.stderr)
+            # 3. Bulk delete removed files
+            if deleted:
+                print(f"[xpool_sync] Executing bulk cloud deletion ({len(deleted)} files, --transfers 16 --checkers 32 --fast-list)...")
+                try:
+                    self.client._direct_backend.bulk_delete_cloud(
+                        rel_paths=deleted,
+                        remote_prefix="JULES_ZONE"
+                    )
+                    for rel_path in deleted:
+                        if rel_path in updated_manifest:
+                            del updated_manifest[rel_path]
+                        success_deleted += 1
+                        print(f"  - delete: JULES_ZONE/{rel_path} (protected in vault)")
+                except Exception as del_err:
+                    print(f"[xpool_sync] Notice: Bulk delete failed ({del_err}), falling back to ThreadPoolExecutor(max_workers=8)...", file=sys.stderr)
+                    def _del_worker(rel_p):
+                        rem_p = f"/JULES_ZONE/{rel_p}"
+                        self.client.delete(path=rem_p)
+                        return rel_p
+
+                    with ThreadPoolExecutor(max_workers=8) as executor:
+                        futs = [executor.submit(_del_worker, p) for p in deleted]
+                        for fut in as_completed(futs):
+                            try:
+                                rel_p = fut.result()
+                                if rel_p in updated_manifest:
+                                    del updated_manifest[rel_p]
+                                success_deleted += 1
+                                print(f"  - delete: JULES_ZONE/{rel_p} (protected in vault)")
+                            except Exception as e:
+                                print(f"[xpool_sync] Failed to delete file: {e}", file=sys.stderr)
+
+        else:
+            # GatewayBackend mode: ThreadPoolExecutor(max_workers=6)
+            uploads = created + modified
+            if uploads:
+                print(f"[xpool_sync] Pushing {len(uploads)} files via Gateway (ThreadPoolExecutor max_workers=6)...")
+                def _gateway_up_worker(rel_p):
+                    loc_p = self.jules_zone_dir / rel_p
+                    rem_p = f"/JULES_ZONE/{rel_p}"
+                    with open(loc_p, "rb") as f:
+                        d = f.read()
+                    try:
+                        c_str = d.decode("utf-8")
+                        b64 = False
+                    except UnicodeDecodeError:
+                        c_str = base64.b64encode(d).decode("ascii")
+                        b64 = True
+                    action = "create" if rel_p in created else "update"
+                    res = self.client.write(path=rem_p, content=c_str, is_base64=b64)
+                    f_sha, f_sz = compute_file_sha256(loc_p)
+                    with manifest_lock:
+                        updated_manifest[rel_p] = {"sha256": f_sha, "size_bytes": f_sz, "remote_path": rem_p}
+                    return rel_p, action, f_sz, res.get("backup_vault_id")
+
+                with ThreadPoolExecutor(max_workers=6) as executor:
+                    futs = [executor.submit(_gateway_up_worker, p) for p in uploads]
+                    for fut in as_completed(futs):
+                        try:
+                            rel_p, act, sz, b_id = fut.result()
+                            if act == "create":
+                                success_created += 1
+                                print(f"  + create: JULES_ZONE/{rel_p} ({sz} bytes)")
+                            else:
+                                success_modified += 1
+                                print(f"  * update: JULES_ZONE/{rel_p} ({sz} bytes)")
+                        except Exception as e:
+                            print(f"[xpool_sync] Failed to push file: {e}", file=sys.stderr)
+
+            if deleted:
+                print(f"[xpool_sync] Deleting {len(deleted)} files via Gateway (ThreadPoolExecutor max_workers=6)...")
+                def _gateway_del_worker(rel_p):
+                    rem_p = f"/JULES_ZONE/{rel_p}"
+                    res = self.client.delete(path=rem_p)
+                    with manifest_lock:
+                        if rel_p in updated_manifest:
+                            del updated_manifest[rel_p]
+                    return rel_p, res.get("recovery_version_id", "yes")
+
+                with ThreadPoolExecutor(max_workers=6) as executor:
+                    futs = [executor.submit(_gateway_del_worker, p) for p in deleted]
+                    for fut in as_completed(futs):
+                        try:
+                            rel_p, v_id = fut.result()
+                            success_deleted += 1
+                            print(f"  - delete: JULES_ZONE/{rel_p} (protected in vault: {v_id})")
+                        except Exception as e:
+                            print(f"[xpool_sync] Failed to delete file: {e}", file=sys.stderr)
 
         save_manifest(self.manifest_path, updated_manifest)
-        print(f"[xpool_sync] Push complete: +{len(created)} created, *{len(modified)} modified, -{len(deleted)} deleted.")
+        print(f"[xpool_sync] Push complete: +{success_created} created, *{success_modified} modified, -{success_deleted} deleted.")
         return {
-            "created": len(created),
-            "modified": len(modified),
-            "deleted": len(deleted)
+            "created": success_created,
+            "modified": success_modified,
+            "deleted": success_deleted
         }
 
 

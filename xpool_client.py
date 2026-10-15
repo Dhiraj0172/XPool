@@ -18,6 +18,10 @@ import subprocess
 import tempfile
 import atexit
 import argparse
+import socket
+import http.client
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -125,6 +129,7 @@ class DirectCloudBackend:
         if not self.vault_path or not self.vault_path.is_file():
             raise FileNotFoundError(f"Cloud vault file (.xpool_cloud_vault.bin) not found.")
 
+        self._lock = threading.Lock()
         self.rclone_bin = self._find_or_install_rclone()
         self.ephemeral_conf = self._create_ephemeral_config()
         atexit.register(self.cleanup)
@@ -224,7 +229,13 @@ class DirectCloudBackend:
 
     def _run_rclone(self, args: List[str], input_data: Optional[bytes] = None, timeout: int = 60) -> subprocess.CompletedProcess:
         """Executes rclone command against ephemeral config."""
-        cmd = [self.rclone_bin, "--config", str(self.ephemeral_conf)] + args
+        cmd = [
+            self.rclone_bin,
+            "--config", str(self.ephemeral_conf),
+            "--drive-pacer-min-sleep", "10ms",
+            "--drive-use-trash=false",
+            "--server-side-across-configs"
+        ] + args
         return subprocess.run(
             cmd,
             input=input_data,
@@ -325,27 +336,181 @@ class DirectCloudBackend:
         }
 
     def _ensure_cas_backup(self, clean_path: str) -> Optional[str]:
-        """Synchronously backs up an existing file into _JULES_PROTECTED_VAULT before mutation."""
+        """Synchronously backs up an existing file into _JULES_PROTECTED_VAULT before mutation via server-side copy."""
         remote_target = f"google_unified:{clean_path}"
-        stat_proc = self._run_rclone(["lsjson", remote_target], timeout=30)
-        if stat_proc.returncode == 0:
-            try:
-                entries = json.loads(stat_proc.stdout.decode("utf-8"))
-            except Exception:
-                entries = []
-            if entries and not entries[0].get("IsDir", False):
-                cat_proc = self._run_rclone(["cat", remote_target], timeout=60)
-                if cat_proc.returncode == 0:
-                    digest = hashlib.sha256(cat_proc.stdout).hexdigest()
-                    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                    fname = os.path.basename(clean_path)
-                    backup_name = f"{ts}_{digest[:16]}_{fname}"
-                    vault_target = f"google_unified:_JULES_PROTECTED_VAULT/{backup_name}"
-                    copy_proc = self._run_rclone(["copyto", remote_target, vault_target], timeout=60)
-                    if copy_proc.returncode == 0:
-                        print(f"[DirectCloudBackend] CAS Backup secured in vault: {backup_name}", file=sys.stderr)
-                        return backup_name
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+        fname = os.path.basename(clean_path)
+        token = hashlib.sha256(f"{clean_path}_{ts}".encode()).hexdigest()[:16]
+        backup_name = f"{ts}_{token}_{fname}"
+        vault_target = f"google_unified:_JULES_PROTECTED_VAULT/{backup_name}"
+        copy_proc = self._run_rclone(["copyto", remote_target, vault_target, "--no-traverse"], timeout=30)
+        if copy_proc.returncode == 0:
+            print(f"[DirectCloudBackend] CAS Backup secured in vault: {backup_name}", file=sys.stderr)
+            return backup_name
         return None
+
+    def bulk_cas_backup(
+        self,
+        rel_paths: List[str],
+        remote_prefix: str = "JULES_ZONE",
+        transfers: int = 16,
+        checkers: int = 32
+    ) -> Dict[str, str]:
+        """High-speed bulk server-side CAS backup into _JULES_PROTECTED_VAULT using rclone copy."""
+        if not rel_paths:
+            return {}
+        clean_prefix = remote_prefix.replace("\\", "/").strip("/")
+        norm_paths = [p.replace("\\", "/").lstrip("/") for p in rel_paths]
+        
+        fd, tmp_list_str = tempfile.mkstemp(prefix="xpool_bulk_cas_", suffix=".txt")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                tmp.write("\n".join(norm_paths) + "\n")
+            
+            vault_dest = f"google_unified:_JULES_PROTECTED_VAULT"
+            args = [
+                "copy",
+                f"google_unified:{clean_prefix}",
+                vault_dest,
+                "--files-from-raw", tmp_list_str,
+                "--transfers", str(transfers),
+                "--checkers", str(checkers),
+                "--fast-list"
+            ]
+            proc = self._run_rclone(args, timeout=120)
+            if proc.returncode != 0:
+                print(f"[DirectCloudBackend] Notice: Bulk CAS backup returned {proc.returncode}, falling back to parallel copyto...", file=sys.stderr)
+                return self.parallel_cas_backup([f"{clean_prefix}/{p}" for p in norm_paths])
+            
+            return {p: f"_JULES_PROTECTED_VAULT/{p}" for p in norm_paths}
+        finally:
+            Path(tmp_list_str).unlink(missing_ok=True)
+
+    def parallel_cas_backup(self, clean_paths: List[str], max_workers: int = 16) -> Dict[str, Optional[str]]:
+        """Synchronously backs up multiple existing files in parallel into _JULES_PROTECTED_VAULT."""
+        if not clean_paths:
+            return {}
+        results: Dict[str, Optional[str]] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_path = {
+                executor.submit(self._ensure_cas_backup, p): p for p in clean_paths
+            }
+            for future in as_completed(future_to_path):
+                p = future_to_path[future]
+                try:
+                    results[p] = future.result()
+                except Exception as e:
+                    print(f"[DirectCloudBackend] CAS Backup warning for '{p}': {e}", file=sys.stderr)
+                    results[p] = None
+        return results
+
+    def bulk_copy_to_cloud(
+        self,
+        local_base: Path,
+        rel_paths: List[str],
+        remote_prefix: str = "JULES_ZONE",
+        transfers: int = 16,
+        checkers: int = 32
+    ) -> Dict[str, Any]:
+        """High-speed bulk upload of files to cloud using rclone --files-from-raw."""
+        clean_prefix = remote_prefix.replace("\\", "/").strip("/")
+        if not (clean_prefix == "JULES_ZONE" or clean_prefix.startswith("JULES_ZONE/")):
+            raise PermissionError(f"DirectCloudBackend safety policy violation: Mutations strictly restricted to /JULES_ZONE (attempted: '{remote_prefix}')")
+
+        norm_paths = [p.replace("\\", "/").lstrip("/") for p in rel_paths]
+        fd, tmp_list_str = tempfile.mkstemp(prefix="xpool_bulk_up_", suffix=".txt")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                tmp.write("\n".join(norm_paths) + "\n")
+            remote_dest = f"google_unified:{clean_prefix}"
+            args = [
+                "copy",
+                str(local_base),
+                remote_dest,
+                "--files-from-raw", tmp_list_str,
+                "--transfers", str(transfers),
+                "--checkers", str(checkers),
+                "--fast-list",
+                "--no-traverse",
+                "--drive-chunk-size", "32M",
+                "--drive-upload-cutoff", "32M"
+            ]
+            proc = self._run_rclone(args, timeout=300)
+            if proc.returncode != 0:
+                err = proc.stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"Direct cloud bulk copy to cloud failed: {err}")
+            return {"status": "ok", "transferred_count": len(norm_paths)}
+        finally:
+            Path(tmp_list_str).unlink(missing_ok=True)
+
+    def bulk_copy_from_cloud(
+        self,
+        local_base: Path,
+        rel_paths: List[str],
+        remote_prefix: str = "JULES_ZONE",
+        transfers: int = 16,
+        checkers: int = 32
+    ) -> Dict[str, Any]:
+        """High-speed bulk download of files from cloud using rclone --files-from-raw."""
+        clean_prefix = remote_prefix.replace("\\", "/").strip("/")
+        norm_paths = [p.replace("\\", "/").lstrip("/") for p in rel_paths]
+        fd, tmp_list_str = tempfile.mkstemp(prefix="xpool_bulk_dl_", suffix=".txt")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                tmp.write("\n".join(norm_paths) + "\n")
+            remote_src = f"google_unified:{clean_prefix}"
+            local_base.mkdir(parents=True, exist_ok=True)
+            args = [
+                "copy",
+                remote_src,
+                str(local_base),
+                "--files-from-raw", tmp_list_str,
+                "--transfers", str(transfers),
+                "--checkers", str(checkers),
+                "--fast-list",
+                "--drive-chunk-size", "32M"
+            ]
+            proc = self._run_rclone(args, timeout=300)
+            if proc.returncode != 0:
+                err = proc.stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"Direct cloud bulk copy from cloud failed: {err}")
+            return {"status": "ok", "transferred_count": len(norm_paths)}
+        finally:
+            Path(tmp_list_str).unlink(missing_ok=True)
+
+    def bulk_delete_cloud(
+        self,
+        rel_paths: List[str],
+        remote_prefix: str = "JULES_ZONE",
+        transfers: int = 16,
+        checkers: int = 32
+    ) -> Dict[str, Any]:
+        """High-speed bulk deletion of files on cloud using rclone --files-from-raw."""
+        clean_prefix = remote_prefix.replace("\\", "/").strip("/")
+        if not (clean_prefix == "JULES_ZONE" or clean_prefix.startswith("JULES_ZONE/")):
+            raise PermissionError(f"DirectCloudBackend safety policy violation: Mutations strictly restricted to /JULES_ZONE (attempted: '{remote_prefix}')")
+
+        norm_paths = [p.replace("\\", "/").lstrip("/") for p in rel_paths]
+        fd, tmp_list_str = tempfile.mkstemp(prefix="xpool_bulk_del_", suffix=".txt")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                tmp.write("\n".join(norm_paths) + "\n")
+            remote_dest = f"google_unified:{clean_prefix}"
+            args = [
+                "delete",
+                remote_dest,
+                "--files-from-raw", tmp_list_str,
+                "--transfers", str(transfers),
+                "--checkers", str(checkers),
+                "--fast-list"
+            ]
+            proc = self._run_rclone(args, timeout=120)
+            if proc.returncode != 0:
+                err = proc.stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"Direct cloud bulk delete failed: {err}")
+            return {"status": "deleted", "deleted_count": len(norm_paths)}
+        finally:
+            Path(tmp_list_str).unlink(missing_ok=True)
 
     def write(self, path: str, content: str, is_base64: bool = False) -> Dict[str, Any]:
         """Writes/overwrites a file inside /JULES_ZONE with CAS backup."""
@@ -437,15 +602,17 @@ class XPoolClient:
         self.token = token or os.environ.get("XPOOL_GATEWAY_TOKEN", DEFAULT_TOKEN)
         self._direct_backend: Optional[DirectCloudBackend] = None
         self._active_backend: str = "gateway" if self.mode != "direct" else "direct_cloud"
+        self._lock = threading.Lock()
 
         # Explicit direct mode
         if self.mode == "direct":
             self._init_direct_backend()
 
     def _init_direct_backend(self) -> DirectCloudBackend:
-        """Instantiates DirectCloudBackend if not already initialized."""
-        if self._direct_backend is None:
-            self._direct_backend = DirectCloudBackend()
+        """Instantiates DirectCloudBackend if not already initialized (thread-safe)."""
+        with self._lock:
+            if self._direct_backend is None:
+                self._direct_backend = DirectCloudBackend()
             self._active_backend = "direct_cloud"
         return self._direct_backend
 
@@ -475,15 +642,15 @@ class XPoolClient:
         endpoint: str,
         json_body: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
-        timeout: int = 30,
+        timeout: int = 35,
         retried_after_failover: bool = False
     ) -> Dict[str, Any]:
         """Executes JSON HTTP request against gateway with auto-failover to DirectCloudBackend."""
         if self._active_backend == "direct_cloud" or self.mode == "direct":
-            raise RuntimeError("Request called while direct cloud backend active")
+            raise RuntimeError("FAILOVER_TO_DIRECT_CLOUD")
 
         # Check for simulated offline URL
-        if self.is_gateway_offline_url(self.base_url) and self.mode in ("auto", "direct"):
+        if self.is_gateway_offline_url(self.base_url) and self.mode in ("auto", "gateway", "direct"):
             print(
                 f"[XPoolClient] Notice: Offline PC simulation detected ({self.base_url}). "
                 f"Auto-switching to DirectCloudBackend (15.4 TiB google_unified: direct connection)...",
@@ -516,10 +683,10 @@ class XPoolClient:
                 except Exception:
                     return {"raw": resp_bytes.decode("utf-8", errors="replace")}
         except urllib.error.HTTPError as e:
-            # Cloudflare 502/503/530/404 indicating PC shutdown or tunnel death
-            if e.code in (502, 503, 521, 522, 523, 524, 530, 404) and self.mode == "auto":
+            # Cloudflare / Gateway timeout / connection failure codes (500, 502, 503, 504, 520-530, 404)
+            if e.code in (500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 530, 404) and self.mode in ("auto", "gateway"):
                 print(
-                    f"[XPoolClient] Notice: Gateway returned HTTP {e.code} (Windows PC offline / tunnel down). "
+                    f"[XPoolClient] Notice: Gateway returned HTTP {e.code} (Windows PC uplink saturated / offline / timeout). "
                     f"Auto-switching to DirectCloudBackend (15.4 TiB google_unified: direct connection)...",
                     file=sys.stderr
                 )
@@ -534,8 +701,8 @@ class XPoolClient:
             except Exception:
                 msg = clean_err
             raise RuntimeError(f"Gateway HTTP {e.code} Error on {endpoint}: {msg}")
-        except urllib.error.URLError as e:
-            reason_str = str(e.reason).lower()
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionResetError, http.client.RemoteDisconnected) as e:
+            reason_str = str(getattr(e, "reason", e)).lower()
             is_nxdomain = any(term in reason_str for term in [
                 "getaddrinfo failed",
                 "not known",
@@ -562,17 +729,17 @@ class XPoolClient:
                         retried_after_failover=True
                     )
 
-            # If still unreachable and in auto mode, switch to DirectCloudBackend
-            if self.mode == "auto":
+            # If still unreachable or timed out and in auto/gateway mode, switch to DirectCloudBackend
+            if self.mode in ("auto", "gateway"):
                 print(
-                    f"[XPoolClient] Notice: Connection to gateway failed ({sanitize_text(str(e.reason))}). "
+                    f"[XPoolClient] Notice: Gateway connection error/timeout ({sanitize_text(str(e))}). "
                     f"Auto-switching to DirectCloudBackend (15.4 TiB google_unified: direct connection)...",
                     file=sys.stderr
                 )
                 self._init_direct_backend()
                 raise RuntimeError("FAILOVER_TO_DIRECT_CLOUD")
 
-            clean_reason = sanitize_text(str(e.reason))
+            clean_reason = sanitize_text(str(e))
             raise RuntimeError(f"Gateway Connection Error on {endpoint}: {clean_reason}")
 
     def health(self) -> Dict[str, Any]:
@@ -581,8 +748,8 @@ class XPoolClient:
             return self._init_direct_backend().health()
         try:
             return self._request("GET", "/api/v1/health")
-        except RuntimeError as e:
-            if str(e) == "FAILOVER_TO_DIRECT_CLOUD":
+        except Exception as e:
+            if str(e) == "FAILOVER_TO_DIRECT_CLOUD" or self._active_backend == "direct_cloud":
                 return self._init_direct_backend().health()
             raise
 
@@ -592,8 +759,8 @@ class XPoolClient:
             return self._init_direct_backend().list(path)
         try:
             return self._request("POST", "/api/v1/list", json_body={"path": path})
-        except RuntimeError as e:
-            if str(e) == "FAILOVER_TO_DIRECT_CLOUD":
+        except Exception as e:
+            if str(e) == "FAILOVER_TO_DIRECT_CLOUD" or self._active_backend == "direct_cloud":
                 return self._init_direct_backend().list(path)
             raise
 
@@ -603,8 +770,8 @@ class XPoolClient:
             return self._init_direct_backend().read(path)
         try:
             return self._request("POST", "/api/v1/read", json_body={"path": path})
-        except RuntimeError as e:
-            if str(e) == "FAILOVER_TO_DIRECT_CLOUD":
+        except Exception as e:
+            if str(e) == "FAILOVER_TO_DIRECT_CLOUD" or self._active_backend == "direct_cloud":
                 return self._init_direct_backend().read(path)
             raise
 
@@ -618,8 +785,8 @@ class XPoolClient:
                 "content": content,
                 "is_base64": is_base64
             })
-        except RuntimeError as e:
-            if str(e) == "FAILOVER_TO_DIRECT_CLOUD":
+        except Exception as e:
+            if str(e) == "FAILOVER_TO_DIRECT_CLOUD" or self._active_backend == "direct_cloud":
                 return self._init_direct_backend().write(path, content, is_base64)
             raise
 
@@ -629,8 +796,8 @@ class XPoolClient:
             return self._init_direct_backend().delete(path)
         try:
             return self._request("POST", "/api/v1/delete", json_body={"path": path})
-        except RuntimeError as e:
-            if str(e) == "FAILOVER_TO_DIRECT_CLOUD":
+        except Exception as e:
+            if str(e) == "FAILOVER_TO_DIRECT_CLOUD" or self._active_backend == "direct_cloud":
                 return self._init_direct_backend().delete(path)
             raise
 
@@ -643,8 +810,8 @@ class XPoolClient:
             payload["target_path"] = target_path
         try:
             return self._request("POST", "/api/v1/restore", json_body=payload)
-        except RuntimeError as e:
-            if str(e) == "FAILOVER_TO_DIRECT_CLOUD":
+        except Exception as e:
+            if str(e) == "FAILOVER_TO_DIRECT_CLOUD" or self._active_backend == "direct_cloud":
                 return self._init_direct_backend().restore(version_id, target_path)
             raise
 
