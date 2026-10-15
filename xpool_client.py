@@ -140,6 +140,27 @@ class DirectCloudBackend:
         if rc:
             return rc
 
+        def _download_archive(url: str) -> bytes:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            req = urllib.request.Request(url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return resp.read()
+            except Exception as url_err:
+                try:
+                    res = subprocess.run(
+                        ["curl", "-fsSL", "-A", "Mozilla/5.0", url],
+                        capture_output=True,
+                        check=True
+                    )
+                    return res.stdout
+                except Exception as curl_err:
+                    raise RuntimeError(
+                        f"Failed to download rclone from {url}: urllib error ({url_err}), curl fallback error ({curl_err})"
+                    ) from url_err
+
         system = platform.system().lower()
         if system == "windows":
             candidates = [
@@ -157,13 +178,13 @@ class DirectCloudBackend:
             print("[DirectCloudBackend] Downloading standalone rclone for Windows...", file=sys.stderr)
             bin_dir.mkdir(parents=True, exist_ok=True)
             url = "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
-            with urllib.request.urlopen(url, timeout=30) as resp:
-                zf = zipfile.ZipFile(io.BytesIO(resp.read()))
-                for name in zf.namelist():
-                    if name.endswith("rclone.exe"):
-                        with open(bin_exe, "wb") as f:
-                            f.write(zf.read(name))
-                        break
+            zip_bytes = _download_archive(url)
+            zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+            for name in zf.namelist():
+                if name.endswith("rclone.exe"):
+                    with open(bin_exe, "wb") as f:
+                        f.write(zf.read(name))
+                    break
             return str(bin_exe)
         else:
             # Linux standalone download strictly inside tempfile.gettempdir() (/tmp/xpool_bin)
@@ -185,14 +206,14 @@ class DirectCloudBackend:
             print("[DirectCloudBackend] Downloading standalone rclone for Linux...", file=sys.stderr)
             bin_dir.mkdir(parents=True, exist_ok=True)
             url = "https://downloads.rclone.org/rclone-current-linux-amd64.zip"
-            with urllib.request.urlopen(url, timeout=30) as resp:
-                zf = zipfile.ZipFile(io.BytesIO(resp.read()))
-                for name in zf.namelist():
-                    if name.endswith("/rclone") and not name.endswith("/"):
-                        with open(bin_exe, "wb") as f:
-                            f.write(zf.read(name))
-                        bin_exe.chmod(0o755)
-                        break
+            zip_bytes = _download_archive(url)
+            zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+            for name in zf.namelist():
+                if name.endswith("/rclone") and not name.endswith("/"):
+                    with open(bin_exe, "wb") as f:
+                        f.write(zf.read(name))
+                    bin_exe.chmod(0o755)
+                    break
             return str(bin_exe)
 
     def _create_ephemeral_config(self) -> Path:
@@ -270,7 +291,10 @@ class DirectCloudBackend:
         items_raw = json.loads(proc.stdout.decode("utf-8"))
         items = []
         for it in items_raw:
-            sub_path = f"/{clean}/{it['Path']}".strip("/") if clean else it["Path"]
+            if len(items_raw) == 1 and not it.get("IsDir", False) and (clean == it.get("Path") or clean.endswith("/" + it.get("Path"))):
+                sub_path = clean
+            else:
+                sub_path = f"/{clean}/{it['Path']}".strip("/") if clean else it["Path"]
             items.append({
                 "name": it.get("Name"),
                 "path": "/" + sub_path,
@@ -300,7 +324,10 @@ class DirectCloudBackend:
         for it in items_raw:
             if it.get("IsDir", False):
                 continue
-            sub_path = f"/{clean}/{it['Path']}".strip("/") if clean else it["Path"]
+            if len(items_raw) == 1 and not it.get("IsDir", False) and (clean == it.get("Path") or clean.endswith("/" + it.get("Path"))):
+                sub_path = clean
+            else:
+                sub_path = f"/{clean}/{it['Path']}".strip("/") if clean else it["Path"]
             items.append({
                 "name": it.get("Name"),
                 "path": "/" + sub_path,
@@ -309,6 +336,40 @@ class DirectCloudBackend:
                 "modified_at": it.get("ModTime", "")
             })
         return items
+
+    def stat(self, path: str) -> Optional[Dict[str, Any]]:
+        """Returns metadata for a file or directory on google_unified:."""
+        clean = path.replace("\\", "/").strip("/")
+        remote_target = f"google_unified:{clean}" if clean else "google_unified:"
+        proc = self._run_rclone(["lsjson", remote_target], timeout=30)
+        if proc.returncode != 0:
+            return None
+        try:
+            items_raw = json.loads(proc.stdout.decode("utf-8"))
+        except Exception:
+            return None
+        if not items_raw:
+            return None
+        if len(items_raw) == 1 and not items_raw[0].get("IsDir", False):
+            it = items_raw[0]
+            return {
+                "name": it.get("Name"),
+                "path": "/" + clean,
+                "is_dir": False,
+                "size_bytes": it.get("Size", 0),
+                "modified_at": it.get("ModTime", "")
+            }
+        return {
+            "name": Path(clean).name if clean else "",
+            "path": "/" + clean,
+            "is_dir": True,
+            "size_bytes": 0,
+            "modified_at": ""
+        }
+
+    def read_file(self, path: str) -> Dict[str, Any]:
+        """Reads file contents on google_unified: (alias for read)."""
+        return self.read(path)
 
     def read(self, path: str) -> Dict[str, Any]:
         """Reads file contents on google_unified: (allowed across all 15.4 TiB)."""
@@ -766,6 +827,10 @@ class XPoolClient:
                 return self._init_direct_backend().list(path)
             raise
 
+    def read_file(self, path: str) -> Dict[str, Any]:
+        """Reads file contents via Gateway or DirectCloudBackend (alias for read)."""
+        return self.read(path)
+
     def read(self, path: str) -> Dict[str, Any]:
         """Reads file contents via Gateway or DirectCloudBackend."""
         if self._active_backend == "direct_cloud" or self.mode == "direct":
@@ -776,6 +841,18 @@ class XPoolClient:
             if str(e) == "FAILOVER_TO_DIRECT_CLOUD" or self._active_backend == "direct_cloud":
                 return self._init_direct_backend().read(path)
             raise
+
+    def stat(self, path: str) -> Optional[Dict[str, Any]]:
+        """Returns metadata for path via Gateway or DirectCloudBackend."""
+        if self._active_backend == "direct_cloud" or self.mode == "direct":
+            return self._init_direct_backend().stat(path)
+        try:
+            return self._request("POST", "/api/v1/stat", json_body={"path": path})
+        except Exception:
+            try:
+                return self._init_direct_backend().stat(path)
+            except Exception:
+                return None
 
     def write(self, path: str, content: str, is_base64: bool = False) -> Dict[str, Any]:
         """Writes or overwrites a file via Gateway or DirectCloudBackend under fail-closed protection."""

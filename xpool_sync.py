@@ -305,30 +305,74 @@ class XPoolSyncManager:
         self._ensure_connected()
         print(f"[xpool_sync] Fetching '{clean_path}'...")
 
-        # Check if remote_path is a directory
-        is_dir = False
-        try:
-            list_res = self.client.list(clean_path)
-            items = list_res.get("items", [])
-            if len(items) > 1 or (len(items) == 1 and items[0].get("is_dir")):
-                is_dir = True
-            elif len(items) == 1 and items[0].get("path") == clean_path and not items[0].get("is_dir"):
-                is_dir = False
-            else:
-                is_dir = True
-        except Exception:
-            is_dir = False
+        read_fn = getattr(self.client, "read_file", getattr(self.client, "read", None))
+
+        # Check if remote_path is a single file (via stat, read_file, or list)
+        is_single_file = False
+        stat_fn = getattr(self.client, "stat", None)
+        if callable(stat_fn):
+            try:
+                st = stat_fn(clean_path)
+                if st is not None:
+                    is_single_file = not st.get("is_dir", False)
+            except Exception:
+                pass
+
+        if not is_single_file:
+            try:
+                list_res = self.client.list(clean_path)
+                items = list_res.get("items", [])
+                if len(items) == 1 and not items[0].get("is_dir", False):
+                    is_single_file = True
+                elif len(items) == 0:
+                    # Test if read_file succeeds
+                    try:
+                        read_fn(clean_path)
+                        is_single_file = True
+                    except Exception:
+                        is_single_file = False
+            except Exception:
+                # If list failed, check if read_file succeeds
+                try:
+                    read_fn(clean_path)
+                    is_single_file = True
+                except Exception:
+                    is_single_file = False
 
         fetched_files = []
-        if is_dir:
+        if is_single_file:
+            rel_from_root = clean_path.lstrip("/\\")
+            local_dest = self.x_drive_dir / rel_from_root
+            try:
+                read_res = read_fn(clean_path)
+                content_raw = read_res.get("content", "")
+                if read_res.get("is_base64"):
+                    file_bytes = base64.b64decode(content_raw)
+                elif isinstance(content_raw, str):
+                    file_bytes = content_raw.encode("utf-8")
+                else:
+                    file_bytes = bytes(content_raw)
+                local_dest.parent.mkdir(parents=True, exist_ok=True)
+                with open(local_dest, "wb") as f:
+                    f.write(file_bytes)
+                fetched_files.append({"path": str(local_dest), "size": len(file_bytes)})
+                print(f"[xpool_sync] Fetched single file to {local_dest.relative_to(self.workspace_root)} ({len(file_bytes)} bytes)")
+            except Exception as e:
+                raise RuntimeError(f"Failed to fetch '{clean_path}': {e}")
+        else:
             remote_files = self.list_recursive(clean_path)
             def _fetch_worker(rfile):
                 rpath = rfile["path"]
                 rel_from_root = rpath.lstrip("/\\")
                 local_dest = self.x_drive_dir / rel_from_root
-                read_res = self.client.read(rpath)
+                read_res = read_fn(rpath)
                 content_raw = read_res.get("content", "")
-                file_bytes = base64.b64decode(content_raw) if read_res.get("is_base64") else content_raw.encode("utf-8")
+                if read_res.get("is_base64"):
+                    file_bytes = base64.b64decode(content_raw)
+                elif isinstance(content_raw, str):
+                    file_bytes = content_raw.encode("utf-8")
+                else:
+                    file_bytes = bytes(content_raw)
                 local_dest.parent.mkdir(parents=True, exist_ok=True)
                 with open(local_dest, "wb") as f:
                     f.write(file_bytes)
@@ -343,20 +387,6 @@ class XPoolSyncManager:
                         print(f"  + fetched: {res['rel']} ({res['size']} bytes)")
                     except Exception as e:
                         print(f"[xpool_sync] Error fetching file: {e}", file=sys.stderr)
-        else:
-            rel_from_root = clean_path.lstrip("/\\")
-            local_dest = self.x_drive_dir / rel_from_root
-            try:
-                read_res = self.client.read(clean_path)
-                content_raw = read_res.get("content", "")
-                file_bytes = base64.b64decode(content_raw) if read_res.get("is_base64") else content_raw.encode("utf-8")
-                local_dest.parent.mkdir(parents=True, exist_ok=True)
-                with open(local_dest, "wb") as f:
-                    f.write(file_bytes)
-                fetched_files.append({"path": str(local_dest), "size": len(file_bytes)})
-                print(f"[xpool_sync] Fetched file to {local_dest.relative_to(self.workspace_root)} ({len(file_bytes)} bytes)")
-            except Exception as e:
-                raise RuntimeError(f"Failed to fetch '{clean_path}': {e}")
 
         return {"status": "ok", "remote_path": clean_path, "fetched_files": fetched_files}
 
