@@ -609,6 +609,24 @@ class XPoolSyncManager:
 
         save_manifest(self.manifest_path, updated_manifest)
         print(f"[xpool_sync] Push complete: +{success_created} created, *{success_modified} modified, -{success_deleted} deleted.")
+
+        # Automatic v27 Zero-Touch Brain Sync Post-Push Hook
+        try:
+            script_path = Path(__file__).resolve().parent / "scripts" / "jules_brain_sync.py"
+            if script_path.is_file():
+                summary_done = f"Pushed {success_created} created, {success_modified} modified, {success_deleted} deleted files to /JULES_ZONE/"
+                cmd = [
+                    sys.executable, str(script_path), "update",
+                    "--agent", "Google-Jules (@google/jules)",
+                    "--prompt", "Pushed task deliverables to /JULES_ZONE/ storage pool",
+                    "--done", summary_done,
+                    "--next", "Ready for Operator / Gemini architectural review"
+                ]
+                subprocess.run(cmd, capture_output=True, timeout=30)
+                print("[xpool_sync] [HOOK] Auto-logged task deliverables to Universal Brain Ledger (v27).")
+        except Exception:
+            pass
+
         return {
             "created": success_created,
             "modified": success_modified,

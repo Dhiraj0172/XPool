@@ -84,20 +84,20 @@ When the user's request is to read, create, edit, or sync files on the `X:\` dri
 
 ---
 
-## Section 4: Universal Lifetime Brain (v26) Two-Way Sync Protocol
+## Section 4: Universal Lifetime Brain (v27 Zero-Touch) Two-Way Sync Protocol
 
-This repository is connected to the **5-Node Unified AI Brain (v26)** spanning:
+This repository is connected to the **5-Node Zero-Touch Universal AI Brain Mesh (v27)** spanning:
 - **4x Gemini Accounts** (Continuous Backup, Knowledge, Strategy, Deep Review)
 - **Google Jules** (Autonomous Cloud VM Execution & Heavy Benchmarking)
 - **Antigravity & Hermes** (Workstation Pair-Programming & System Automation)
 
 ### 1. Two-Way Sync Ledger Files (on `/JULES_ZONE/`)
-- `/JULES_ZONE/BRAIN_SYNC_LEDGER.json`: Machine-readable state containing storage telemetry, active pipeline metrics, handoff sessions, and agent task queues.
+- `/JULES_ZONE/BRAIN_SYNC_LEDGER.json`: Machine-readable state containing storage telemetry, active pipeline metrics, handoff sessions, and agent task queues (schema: `v27_zero_touch_brain_mesh`).
 - `/JULES_ZONE/BRAIN_SYNC_LEDGER.md`: Human & model-readable ledger logging latest operator prompts, completed tasks, stress test summaries, and immediate next actions.
-- `/JULES_ZONE/X_DRIVE_LIVE_INDEX.md`: Live broadcast index containing the authoritative structure of the 15.4 TiB storage pool, mirrored automatically every 120s from the Windows PC workstation.
+- `/JULES_ZONE/X_DRIVE_LIVE_INDEX.md`: Live broadcast index containing the authoritative structure of the 15.4 TiB storage pool, mirrored automatically every broadcast cycle.
 
 ### 2. Session Start Protocol (Reading Brain Context)
-At the beginning of your task or session, read the brain state to learn what tasks Gemini, Antigravity, or the Operator have completed and what next action is assigned to you:
+At the beginning of your task or session, bootstrap automatically pulls the brain ledger, or you can inspect it manually:
 ```bash
 # Read current brain state via CLI helper:
 python3 scripts/jules_brain_sync.py status
@@ -106,13 +106,14 @@ python3 scripts/jules_brain_sync.py status
 cat x_drive/JULES_ZONE/BRAIN_SYNC_LEDGER.md
 ```
 
-### 3. Session End Protocol (Logging Task Handoff)
+### 3. Session End Protocol (Zero-Touch Automated Handoff)
 When you complete your task, run tests, or produce deliverables in `./x_drive/JULES_ZONE/`:
 1. Push your deliverables back to storage:
    ```bash
    python xpool_sync.py push
    ```
-2. Log your completed work and hand off the next action to Gemini/Antigravity:
+   *Note: `xpool_sync.py push` automatically triggers a post-push hook that calls `jules_brain_sync.py update` to sync deliverables and task status to `/JULES_ZONE/BRAIN_SYNC_LEDGER.json` & `.md`!*
+2. If you need to log custom next actions for Gemini or Operator manually:
    ```bash
    python3 scripts/jules_brain_sync.py update \
      --prompt "Operator's instruction or task brief" \

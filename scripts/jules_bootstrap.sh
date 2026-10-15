@@ -128,20 +128,21 @@ else
     exit 1
 fi
 
-# 9. Pull Latest Universal Brain (v26) Context
-echo "[INFO] Synchronizing Universal Brain (v26) Ledger from /JULES_ZONE..."
+# 9. Pull Latest Universal Brain (v27 Zero-Touch) Context
+echo "[INFO] Synchronizing Universal Brain (v27 Zero-Touch) Ledger from /JULES_ZONE..."
 BRAIN_CACHE="${HOME}/.cache/jules_brain"
 mkdir -p "${BRAIN_CACHE}"
 if [ -f "${SCRIPT_DIR}/jules_brain_sync.py" ]; then
     python3 "${SCRIPT_DIR}/jules_brain_sync.py" status >/dev/null 2>&1 || true
 fi
 if command -v xpool >/dev/null 2>&1; then
+    xpool get "/JULES_ZONE/BRAIN_SYNC_LEDGER.json" "${BRAIN_CACHE}/BRAIN_SYNC_LEDGER.json" >/dev/null 2>&1 || true
     xpool get "/JULES_ZONE/BRAIN_SYNC_LEDGER.md" "${BRAIN_CACHE}/BRAIN_SYNC_LEDGER.md" >/dev/null 2>&1 || true
     xpool get "/JULES_ZONE/X_DRIVE_LIVE_INDEX.md" "${BRAIN_CACHE}/X_DRIVE_LIVE_INDEX.md" >/dev/null 2>&1 || true
-    echo "[PASS] Universal Brain (v26) ledger & live index synchronized to ${BRAIN_CACHE}."
+    echo "[PASS] Universal Brain (v27) ledger & live index synchronized to ${BRAIN_CACHE}."
 elif [ -f "${SCRIPT_DIR}/../xpool_sync.py" ]; then
     python3 "${SCRIPT_DIR}/../xpool_sync.py" pull >/dev/null 2>&1 || true
-    echo "[PASS] Universal Brain (v26) synced via xpool_sync."
+    echo "[PASS] Universal Brain (v27) synced via xpool_sync."
 fi
 
 echo "=========================================================="

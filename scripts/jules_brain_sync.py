@@ -107,7 +107,7 @@ def pull_ledger() -> dict:
             pass
 
     return {
-        "schema_version": "v26_jules_gemini_unified_brain",
+        "schema_version": "v27_zero_touch_brain_mesh",
         "updated_at_ist": datetime.datetime.now(IST).isoformat(),
         "latest_handoff": {},
         "history": [],
@@ -175,7 +175,7 @@ def push_ledger(data: dict, md_text: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Jules <-> Gemini Universal Brain Sync CLI (v26)")
+    parser = argparse.ArgumentParser(description="Jules <-> Gemini Universal Brain Sync CLI (v27)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("status", help="Read current Universal Brain Ledger state")
@@ -216,7 +216,7 @@ def main():
     }
 
     md_lines = [
-        f"# 🧠 UNIVERSAL LIFETIME BRAIN — JULES + 4-GEMINI SYNC LEDGER (`v26`)",
+        f"# 🧠 UNIVERSAL LIFETIME BRAIN — JULES + 4-GEMINI SYNC LEDGER (`v27`)",
         f"> **Updated at:** `{now_str}` | **Last Active Agent:** `{args.agent}`",
         "",
         "## LATEST HANDOFF SUMMARY",
