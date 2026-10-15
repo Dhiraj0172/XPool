@@ -81,3 +81,43 @@ When the user's request is to read, create, edit, or sync files on the `X:\` dri
    - Automatically triggered on HTTP 530 / 502 / 404 or connection timeouts.
    - Decrypts `.xpool_cloud_vault.bin` into an ephemeral `0600` config file (auto-cleaned on exit via `atexit`).
    - Enforces identical safety policies: 15.4 TiB read-only across the pool; write/delete restricted to `/JULES_ZONE` with synchronous CAS backup in `_JULES_PROTECTED_VAULT`.
+
+---
+
+## Section 4: Universal Lifetime Brain (v26) Two-Way Sync Protocol
+
+This repository is connected to the **5-Node Unified AI Brain (v26)** spanning:
+- **4x Gemini Accounts** (Continuous Backup, Knowledge, Strategy, Deep Review)
+- **Google Jules** (Autonomous Cloud VM Execution & Heavy Benchmarking)
+- **Antigravity & Hermes** (Workstation Pair-Programming & System Automation)
+
+### 1. Two-Way Sync Ledger Files (on `/JULES_ZONE/`)
+- `/JULES_ZONE/BRAIN_SYNC_LEDGER.json`: Machine-readable state containing storage telemetry, active pipeline metrics, handoff sessions, and agent task queues.
+- `/JULES_ZONE/BRAIN_SYNC_LEDGER.md`: Human & model-readable ledger logging latest operator prompts, completed tasks, stress test summaries, and immediate next actions.
+- `/JULES_ZONE/X_DRIVE_LIVE_INDEX.md`: Live broadcast index containing the authoritative structure of the 15.4 TiB storage pool, mirrored automatically every 120s from the Windows PC workstation.
+
+### 2. Session Start Protocol (Reading Brain Context)
+At the beginning of your task or session, read the brain state to learn what tasks Gemini, Antigravity, or the Operator have completed and what next action is assigned to you:
+```bash
+# Read current brain state via CLI helper:
+python3 scripts/jules_brain_sync.py status
+
+# Or inspect the markdown ledger directly if pulled locally:
+cat x_drive/JULES_ZONE/BRAIN_SYNC_LEDGER.md
+```
+
+### 3. Session End Protocol (Logging Task Handoff)
+When you complete your task, run tests, or produce deliverables in `./x_drive/JULES_ZONE/`:
+1. Push your deliverables back to storage:
+   ```bash
+   python xpool_sync.py push
+   ```
+2. Log your completed work and hand off the next action to Gemini/Antigravity:
+   ```bash
+   python3 scripts/jules_brain_sync.py update \
+     --prompt "Operator's instruction or task brief" \
+     --done "Summary of completed changes and verified test results" \
+     --next "Actionable next steps for Gemini or Operator"
+   ```
+This updates `/JULES_ZONE/BRAIN_SYNC_LEDGER.json` and `/JULES_ZONE/BRAIN_SYNC_LEDGER.md` across the storage pool and local workstation manifests immediately.
+
