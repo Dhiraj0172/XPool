@@ -1,6 +1,6 @@
 {
-  "service": "xpool-storage-gateway",
-  "tunnel_url": "https://reseller-albany-triple-pdf.trycloudflare.com",
-  "updated_at": "2026-10-16T14:15:01Z",
-  "status": "online"
+    "service":  "xpool-storage-gateway",
+    "tunnel_url":  "https://gabriel-cookbook-cayman-sox.trycloudflare.com",
+    "updated_at":  "2026-10-16T14:21:00Z",
+    "status":  "online"
 }
